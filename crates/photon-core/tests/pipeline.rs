@@ -50,7 +50,8 @@ fn run(rings: usize, mode: TraceMode, strategy: Strategy) -> (usize, usize, usiz
     let geometry = OutputGeometry::default();
     let paths = geometry.apply(&paths);
     let scan = ScanParams::default();
-    let params = PlannerParams { strategy, ..Default::default() };
+    // These tests are about tracing and budgeting, not the refresh default: fix 40 Hz.
+    let params = PlannerParams { strategy, target_hz: 40.0, min_hz: 25.0, ..Default::default() };
     // Steady state: the same frame twice (object tracking confirms objects on the 2nd frame).
     let mut planner = Planner::new();
     planner.plan(paths.clone(), &scan, &params);
