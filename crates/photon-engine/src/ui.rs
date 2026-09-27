@@ -261,7 +261,8 @@ impl App {
                     }
                 });
             ui.add(egui::Slider::new(&mut p.target_hz, 15.0..=120.0).text("Target refresh (Hz)"));
-            ui.add(egui::Slider::new(&mut p.min_hz, 10.0..=60.0).text("Min refresh (Hz)"));
+            ui.add(egui::Slider::new(&mut p.min_hz, 10.0..=80.0).text("Min refresh (Hz)"))
+                .on_hover_text("The flicker control. Below ~40 Hz the laser visibly strobes; higher = steadier but less content fits.");
             ui.add(egui::Slider::new(&mut p.max_simplify, 0.0..=0.1).text("Max simplify"));
             ui.add(egui::Slider::new(&mut p.max_groups, 1..=6).text("Max groups (D)"));
             ui.add(egui::Slider::new(&mut p.stickiness, 0.0..=2.0).text("Selection stickiness"));
@@ -389,7 +390,11 @@ impl App {
                     format!("Points {} / budget {}", st.points, st.budget),
                 );
                 ui.separator();
-                ui.label(format!("Refresh {:.0} Hz", st.refresh_hz));
+                ui.colored_label(
+                    if st.refresh_hz > 0.0 && st.refresh_hz < 35.0 { Color32::RED } else { ui.visuals().text_color() },
+                    format!("Refresh {:.0} Hz", st.refresh_hz),
+                )
+                .on_hover_text("How often the laser redraws the picture. Below ~40 Hz it visibly flickers on the real laser (the preview can't show this). Raise Min refresh to keep it up.");
                 if st.groups > 1 {
                     ui.label(format!("({} groups)", st.groups));
                 }

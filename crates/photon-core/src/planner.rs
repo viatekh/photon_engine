@@ -70,7 +70,7 @@ pub struct PlannerParams {
     pub priority: Priority,
     /// Refresh rate the frame must reach (A, B, D).
     pub target_hz: f32,
-    /// Lowest acceptable refresh rate (C, E). Below ~25 Hz flicker becomes obvious.
+    /// Lowest acceptable refresh rate (C, E). Below ~40 Hz laser flicker becomes visible.
     pub min_hz: f32,
     /// Largest simplification tolerance B/E may use, in laser units (field is 2.0 wide).
     pub max_simplify: f32,
@@ -96,8 +96,10 @@ impl Default for PlannerParams {
         Self {
             strategy: Strategy::Combined,
             priority: Priority::Salient,
-            target_hz: 40.0,
-            min_hz: 25.0,
+            // Laser light redrawn below ~40 Hz visibly strobes (confirmed on an LC-2000), so
+            // the floor is 40 Hz: fewer shapes, but a steady image.
+            target_hz: 50.0,
+            min_hz: 40.0,
             max_simplify: 0.008,
             max_groups: 3,
             stickiness: 0.5,
