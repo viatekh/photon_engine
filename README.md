@@ -75,6 +75,27 @@ source frame ─► downsample ─► trace (centreline | outline) ─► smooth
   * *Stickiness* favours shapes drawn last frame so the selection doesn't flicker between frames.
 * The output preview shows exactly what is sent to the DAC; dropped shapes show in grey.
 
+## Recording a problem for analysis
+
+If something looks wrong on the laser (flicker, shapes jumping, missing or wrong shapes):
+
+1. Click **● Record** in the top bar while it happens (it stops by itself after 20 s).
+2. The file lands in `recordings/rec-<time>.jsonl.gz` (the path is shown next to the button).
+3. Send it: either commit it (`git add recordings/<file> && git commit -m "recording" && git push`)
+   or put it in Google Drive. Say what you saw and roughly when.
+
+A recording holds, per frame: the small working image the tracer saw, every traced shape (drawn or
+dropped), the planner's numbers and the output state, plus your settings. It does not contain the
+full-resolution video. Typical size is 5–30 MB.
+
+Tools:
+
+```sh
+python3 tools/analyse_recording.py recordings/rec-123.jsonl.gz              # stability report
+python3 tools/analyse_recording.py recordings/rec-123.jsonl.gz --sheet 100 16   # frames as an image
+cargo run --release -- --replay recordings/rec-123.jsonl.gz /tmp/after.jsonl.gz # re-run with current code
+```
+
 ## Safety behaviour
 
 * Always starts disarmed; arming is never saved. Space/Esc blacks out at once (the current frame is cut short).

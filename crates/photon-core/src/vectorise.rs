@@ -309,7 +309,8 @@ fn label(mask: &[bool], w: usize, h: usize) -> Vec<u32> {
 }
 
 /// Filter a padded stroke mask to components whose skeleton is line-like: at least `min_len`
-/// pixels long, with few ends/junctions (average unbranched run of 8+ pixels).
+/// pixels long, with few loose ends (12+ skeleton pixels per end). Crossings are fine - line
+/// art crosses itself all the time - but texture and filigree skeletons are full of spurs.
 fn line_like(mask: Vec<bool>, w: usize, h: usize, min_len: f32) -> Vec<bool> {
     let labels = label(&mask, w, h);
     let mut skel = mask.clone();
@@ -333,13 +334,13 @@ fn line_like(mask: Vec<bool>, w: usize, h: usize, min_len: f32) -> Vec<bool> {
                 .iter()
                 .filter(|&&(dx, dy)| at(dx, dy) && !at(dx, 0) && !at(0, dy))
                 .count();
-            if k != 2 {
+            if k <= 1 {
                 nodes[l] += 1;
             }
         }
     }
     let keep: Vec<bool> = (0..=n)
-        .map(|l| l > 0 && len[l] as f32 >= min_len.max(4.0) && nodes[l] * 8 <= len[l])
+        .map(|l| l > 0 && len[l] as f32 >= min_len.max(4.0) && nodes[l] * 12 <= len[l])
         .collect();
     mask.iter().zip(&labels).map(|(&m, &l)| m && keep[l as usize]).collect()
 }

@@ -116,6 +116,32 @@ impl App {
                     self.shared.armed.store(!armed, Ordering::SeqCst);
                 }
                 ui.separator();
+                let rec = self.shared.recording.lock().clone();
+                let requested = self.shared.record_requested.load(Ordering::SeqCst);
+                let (label, fill) = if rec.active || requested {
+                    (
+                        format!("■ Stop recording ({:.0}s / {}s)", rec.seconds, crate::recorder::MAX_DURATION.as_secs()),
+                        Color32::from_rgb(150, 20, 60),
+                    )
+                } else {
+                    ("● Record".to_string(), Color32::from_rgb(60, 60, 60))
+                };
+                let rec_btn = egui::Button::new(egui::RichText::new(label).color(Color32::WHITE)).fill(fill);
+                if ui
+                    .add(rec_btn)
+                    .on_hover_text(if rec.message.is_empty() {
+                        "Capture up to 20 s of what the engine sees and decides, for analysis.".to_string()
+                    } else {
+                        rec.message.clone()
+                    })
+                    .clicked()
+                {
+                    self.shared.record_requested.store(!(rec.active || requested), Ordering::SeqCst);
+                }
+                if !rec.active && !rec.message.is_empty() {
+                    ui.small(&rec.message);
+                }
+                ui.separator();
                 let out = self.shared.output_status.lock().clone();
                 let dot = if out.connected { Color32::GREEN } else { Color32::RED };
                 ui.colored_label(dot, "⏺");
@@ -237,8 +263,8 @@ impl App {
             ui.add(egui::Slider::new(&mut p.max_simplify, 0.0..=0.1).text("Max simplify"));
             ui.add(egui::Slider::new(&mut p.max_groups, 1..=6).text("Max groups (D)"));
             ui.add(egui::Slider::new(&mut p.stickiness, 0.0..=2.0).text("Selection stickiness"));
-            ui.checkbox(&mut p.split_oversized, "Split shapes too big for one frame")
-                .on_hover_text("A connected shape that can never fit is split into its separate strokes (each still drawn whole). Off: it is not drawn at all.");
+            ui.checkbox(&mut p.split_oversized, "Split very large shapes into strokes")
+                .on_hover_text("A connected shape needing over half the frame is split into its separate strokes (each still drawn whole). Off: shapes are only drawn whole, so very large ones may not be drawn at all.");
         });
 
         egui::CollapsingHeader::new("Output").default_open(true).show(ui, |ui| {

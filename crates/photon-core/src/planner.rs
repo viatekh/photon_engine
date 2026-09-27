@@ -77,8 +77,8 @@ pub struct PlannerParams {
     pub max_groups: usize,
     /// 0..1 bonus for shapes drawn last frame, so the selection does not flicker.
     pub stickiness: f32,
-    /// A shape too big to draw in one frame on its own is split into its separate strokes
-    /// (each still drawn whole). Off = such shapes are never drawn.
+    /// A shape needing more than half a frame's budget is split into its separate strokes
+    /// (each still drawn whole). Off = shapes are only ever drawn whole (big ones may never be).
     pub split_oversized: bool,
 }
 
@@ -130,7 +130,9 @@ pub struct Plan {
 
 #[derive(Default)]
 pub struct Planner {
+    /// Paths and shapes drawn last frame, as (centre, length), for stickiness.
     previous: Vec<(Vec2, f32)>,
+    previous_shapes: Vec<(Vec2, f32)>,
 }
 
 impl Planner {
@@ -196,6 +198,7 @@ impl Planner {
         let frames: Vec<ScanFrame> = groups.iter().map(|g| scan::render(g, scan)).collect();
         let drawn: Vec<Path> = groups.into_iter().flatten().collect();
         self.previous = drawn.iter().map(|p| (p.centroid(), p.length())).collect();
+        self.previous_shapes = shape_summaries(&drawn).into_iter().map(|(_, c, l)| (c, l)).collect();
 
         let points = frames.iter().map(|f| f.points.len()).max().unwrap_or(0);
         let total: usize = frames.iter().map(|f| f.points.len()).sum();
@@ -228,50 +231,71 @@ impl Planner {
     /// Sort by priority, best first, keeping each shape's paths together (a shape's score is the
     /// sum of its paths'). Shapes matching last frame's selection get a boost.
     fn rank(&self, paths: Vec<Path>, params: &PlannerParams) -> Vec<Path> {
-        let scored: Vec<(f32, Path)> = paths
+        let similar = |(ac, al): (Vec2, f32), (bc, bl): (Vec2, f32)| {
+            ac.distance(bc) < 0.06 && (al - bl).abs() <= 0.35 * al.max(bl)
+        };
+        // (score, path, was this path drawn last frame)
+        let scored: Vec<(f32, Path, bool)> = paths
             .into_iter()
             .map(|p| {
                 let (lo, hi) = p.bounds();
-                let mut s = match params.priority {
+                let s = match params.priority {
                     Priority::Salient => p.weight * p.length(),
                     Priority::Largest => lo.distance(hi),
                     Priority::Longest => p.length(),
                     Priority::Brightest => p.weight * (1.0 + p.length() * 0.01),
                     Priority::Central => 1.0 / (0.05 + p.centroid().length()),
                 };
-                let c = p.centroid();
-                let len = p.length();
-                let seen = self.previous.iter().any(|&(pc, pl)| {
-                    pc.distance(c) < 0.05 && (pl - len).abs() <= 0.3 * pl.max(len)
-                });
-                if seen {
-                    s *= 1.0 + params.stickiness;
-                }
-                (s, p)
+                let me = (p.centroid(), p.length());
+                let seen = self.previous.iter().any(|&prev| similar(me, prev));
+                (s, p, seen)
             })
             .collect();
-        // Per shape: summed score, total length and bounds.
-        let mut shapes_acc: HashMap<u32, (f32, f32, Vec2, Vec2)> = HashMap::new();
-        for (s, p) in &scored {
-            if p.group != NO_GROUP {
-                let (lo, hi) = p.bounds();
-                let e = shapes_acc
-                    .entry(p.group)
-                    .or_insert((0.0, 0.0, Vec2::new(f32::MAX, f32::MAX), Vec2::new(f32::MIN, f32::MIN)));
-                e.0 += s;
-                e.1 += p.length();
-                e.2 = Vec2::new(e.2.x.min(lo.x), e.2.y.min(lo.y));
-                e.3 = Vec2::new(e.3.x.max(hi.x), e.3.y.max(hi.y));
+        // Per shape: summed score, total length, length already drawn last frame, bounds.
+        let mut shapes_acc: HashMap<u32, (f32, f32, f32, Vec2, Vec2)> = HashMap::new();
+        for (s, p, seen) in &scored {
+            let key = if p.group == NO_GROUP { continue } else { p.group };
+            let (lo, hi) = p.bounds();
+            let e = shapes_acc
+                .entry(key)
+                .or_insert((0.0, 0.0, 0.0, Vec2::new(f32::MAX, f32::MAX), Vec2::new(f32::MIN, f32::MIN)));
+            e.0 += s;
+            e.1 += p.length();
+            if *seen {
+                e.2 += p.length();
             }
+            e.3 = Vec2::new(e.3.x.min(lo.x), e.3.y.min(lo.y));
+            e.4 = Vec2::new(e.4.x.max(hi.x), e.4.y.max(hi.y));
         }
         let salient = params.priority == Priority::Salient;
+        let centre_of = |g: u32| {
+            let mut sum = Vec2::ZERO;
+            let mut len = 0.0;
+            for (_, p, _) in scored.iter().filter(|(_, p, _)| p.group == g) {
+                sum = sum + p.centroid() * p.length();
+                len += p.length();
+            }
+            sum * (1.0 / len.max(1e-6))
+        };
         let shape_score: HashMap<u32, f32> = shapes_acc
-            .into_iter()
-            .map(|(g, (s, len, lo, hi))| {
+            .iter()
+            .map(|(&g, &(s, len, seen_len, lo, hi))| {
                 // Salient: a tangle (much longer than it is big) is worth less than a clean
                 // contour of the same length. A circle has length/diagonal ~2.2; allow ~3.
                 let factor = if salient { (3.0 * lo.distance(hi) / len.max(1e-6)).min(1.0) } else { 1.0 };
-                (g, s * factor)
+                // Stickiness: how much of this shape was on screen last frame. Checked per
+                // path (survives shapes merging / splitting) and per whole shape (survives
+                // the tracer splitting a shape into different pieces).
+                let shape_seen = self.previous_shapes.iter().any(|&prev| similar((centre_of(g), len), prev));
+                let seen = if shape_seen { 1.0 } else { seen_len / len.max(1e-6) };
+                (g, s * factor * (1.0 + params.stickiness * seen))
+            })
+            .collect();
+        let scored: Vec<(f32, Path)> = scored
+            .into_iter()
+            .map(|(s, p, seen)| {
+                let bonus = if p.group == NO_GROUP && seen { 1.0 + params.stickiness } else { 1.0 };
+                (s * bonus, p)
             })
             .collect();
         // Sort key: (shape score, shape id, own score). Ungrouped paths are their own shape.
@@ -289,6 +313,18 @@ impl Planner {
         keyed.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)).then(b.2.total_cmp(&a.2)));
         keyed.into_iter().map(|(_, _, _, p)| p).collect()
     }
+}
+
+/// (group, length-weighted centre, total length) per shape; ungrouped paths are their own shape.
+fn shape_summaries(paths: &[Path]) -> Vec<(u32, Vec2, f32)> {
+    let mut acc: HashMap<u64, (u32, Vec2, f32)> = HashMap::new();
+    for (i, p) in paths.iter().enumerate() {
+        let key = if p.group == NO_GROUP { (1u64 << 32) + i as u64 } else { p.group as u64 };
+        let e = acc.entry(key).or_insert((p.group, Vec2::ZERO, 0.0));
+        e.1 = e.1 + p.centroid() * p.length();
+        e.2 += p.length();
+    }
+    acc.into_values().map(|(g, c, l)| (g, c * (1.0 / l.max(1e-6)), l)).collect()
 }
 
 /// Split a ranked list into shapes: consecutive paths sharing a group.
@@ -328,8 +364,11 @@ pub fn whole_shapes(
     while let Some(shape) = queue.pop_front() {
         if split_oversized && shape.len() > 1 {
             let alone: usize = shape.iter().map(|p| scan::lit_cost(p, scan) + scan.blank_cost(0.05)).sum();
-            if alone > budget {
-                // Can never fit whole: offer its strokes individually, in their own priority order.
+            // Split anything over half the budget, not just over the whole budget: a shape near
+            // the budget would otherwise flip between "split, mostly drawn" and "whole, dropped"
+            // as its size wobbles frame to frame.
+            if alone > budget / 2 {
+                // Offer its strokes individually, in their own priority order.
                 for (i, p) in shape.into_iter().enumerate() {
                     queue.insert(i, vec![p]);
                 }

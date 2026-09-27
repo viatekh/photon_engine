@@ -4,6 +4,7 @@
 
 use crate::dac::{Dac, DacSelection};
 use crate::input::{SourceSelection, VideoSource};
+use crate::recorder::{Recorder, RecordingStatus, MAX_DURATION};
 use crate::settings::Settings;
 use parking_lot::{Mutex, RwLock};
 use photon_core::detail::AutoDetail;
@@ -55,6 +56,9 @@ pub struct Shared {
     pub monitor: Mutex<Arc<Vec<LaserPoint>>>,
     pub input_status: Mutex<InputStatus>,
     pub output_status: Mutex<OutputStatus>,
+    /// Set by the UI to start / stop recording; the pipeline thread does the work.
+    pub record_requested: AtomicBool,
+    pub recording: Mutex<RecordingStatus>,
     /// Never persisted: the app always starts disarmed.
     pub armed: AtomicBool,
     pub shutdown: AtomicBool,
@@ -70,6 +74,8 @@ impl Shared {
             monitor: Mutex::new(Arc::new(Vec::new())),
             input_status: Mutex::new(InputStatus::default()),
             output_status: Mutex::new(OutputStatus::default()),
+            record_requested: AtomicBool::new(false),
+            recording: Mutex::new(RecordingStatus::default()),
             armed: AtomicBool::new(false),
             shutdown: AtomicBool::new(false),
             seq: AtomicU64::new(0),
@@ -101,9 +107,11 @@ fn pipeline(shared: Arc<Shared>) {
     let mut retry_at = Instant::now();
     let mut frames = 0u32;
     let mut fps_since = Instant::now();
+    let mut recorder: Option<Recorder> = None;
 
     while !shared.shutdown.load(Ordering::Relaxed) {
         let settings = shared.settings.read().clone();
+        update_recorder(&shared, &mut recorder);
 
         // (Re)connect the source when the selection changes or after an error.
         if settings.source != source_sel {
@@ -128,7 +136,9 @@ fn pipeline(shared: Arc<Shared>) {
 
         if settings.test_pattern_on {
             let paths = settings.geometry.apply(&settings.test_pattern.paths());
-            publish(&shared, planner.plan(paths, &settings.scan, &settings.planner));
+            let plan = planner.plan(paths, &settings.scan, &settings.planner);
+            record(&shared, &mut recorder, &settings, None, &plan, 1.0, 0.0);
+            publish(&shared, plan);
             thread::sleep(Duration::from_millis(30));
             continue;
         }
@@ -164,13 +174,14 @@ fn pipeline(shared: Arc<Shared>) {
                     }
                 }
             }
+            let level_used = detail.level;
             let vp = detail.apply(&settings.vectorise, &settings.auto_detail);
             let paths = vectorise(&image, &vp);
             let paths = settings.geometry.apply(&paths);
             let plan = planner.plan(paths, &settings.scan, &settings.planner);
             detail.update(&plan.stats, &settings.auto_detail);
             previous = Some(image.clone());
-            result = Some((image, plan, t0.elapsed()));
+            result = Some((image, plan, t0.elapsed(), level_used));
         });
         match received {
             Err(e) => {
@@ -179,7 +190,9 @@ fn pipeline(shared: Arc<Shared>) {
                 retry_at = Instant::now() + Duration::from_secs(1);
             }
             Ok(_) => {
-                if let Some((image, plan, took)) = result {
+                if let Some((image, plan, took, level_used)) = result {
+                    let ms = took.as_secs_f32() * 1000.0;
+                    record(&shared, &mut recorder, &settings, Some(&image), &plan, level_used, ms);
                     publish(&shared, plan);
                     let seq = shared.next_seq();
                     *shared.preview.lock() = Some(Arc::new(Preview { image, seq }));
@@ -204,6 +217,62 @@ fn set_input_msg(shared: &Shared, msg: String) {
     if st.message != msg {
         log::info!("input: {msg}");
         st.message = msg;
+    }
+}
+
+/// Start/stop the recorder to match the UI's request, and enforce the length limit.
+fn update_recorder(shared: &Shared, recorder: &mut Option<Recorder>) {
+    let want = shared.record_requested.load(Ordering::Relaxed);
+    let over = recorder.as_ref().is_some_and(|r| r.elapsed() >= MAX_DURATION);
+    if want && recorder.is_none() {
+        match Recorder::start() {
+            Ok(r) => *recorder = Some(r),
+            Err(e) => {
+                shared.record_requested.store(false, Ordering::Relaxed);
+                shared.recording.lock().message = format!("Could not start recording: {e:#}");
+            }
+        }
+    } else if (!want || over) && recorder.is_some() {
+        shared.record_requested.store(false, Ordering::Relaxed);
+        let r = recorder.take().unwrap();
+        let frames = r.frames();
+        let msg = match r.finish() {
+            Ok(p) => {
+                let size = std::fs::metadata(&p).map(|m| m.len() as f32 / 1e6).unwrap_or(0.0);
+                let full = std::fs::canonicalize(&p).unwrap_or(p);
+                format!("Saved {frames} frames, {size:.1} MB: {}", full.display())
+            }
+            Err(e) => format!("Recording failed: {e:#}"),
+        };
+        log::info!("{msg}");
+        let mut st = shared.recording.lock();
+        st.active = false;
+        st.message = msg;
+    }
+    if let Some(r) = recorder {
+        let mut st = shared.recording.lock();
+        st.active = true;
+        st.seconds = r.elapsed().as_secs_f32();
+        st.frames = r.frames();
+        st.megabytes = r.raw_megabytes();
+    }
+}
+
+fn record(
+    shared: &Shared,
+    recorder: &mut Option<Recorder>,
+    settings: &Settings,
+    image: Option<&WorkImage>,
+    plan: &Plan,
+    level: f32,
+    ms: f32,
+) {
+    let Some(r) = recorder.as_mut() else { return };
+    let armed = shared.armed.load(Ordering::Relaxed);
+    let output = shared.output_status.lock().clone();
+    if let Err(e) = r.record(settings, image, plan, level, ms, armed, &output) {
+        log::error!("recording error: {e:#}");
+        shared.record_requested.store(false, Ordering::Relaxed);
     }
 }
 
