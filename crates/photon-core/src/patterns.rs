@@ -14,15 +14,27 @@ pub enum TestPattern {
     /// Star (sharp corners), small circles (tight curves) and a big circle (speed): tune
     /// lit speed / acceleration / colour delay until all are crisp and closed.
     ScannerTest,
+    /// Calibration: full border and corner marks drawn slowly (accurate), for aligning a
+    /// camera image to laser coordinates.
+    Registration,
+    /// Calibration: rows of dashes drawn in alternating directions. Colour delay error shows
+    /// as odd rows shifted against even rows.
+    DelayComb,
+    /// Calibration: many short separate lines (lots of blanked jumps). Settle-time error shows
+    /// as hooks or tails at line starts.
+    JumpGrid,
 }
 
 impl TestPattern {
-    pub const ALL: [TestPattern; 5] = [
+    pub const ALL: [TestPattern; 8] = [
         TestPattern::Frame,
         TestPattern::Circle,
         TestPattern::Grid,
         TestPattern::ColourBars,
         TestPattern::ScannerTest,
+        TestPattern::Registration,
+        TestPattern::DelayComb,
+        TestPattern::JumpGrid,
     ];
 
     pub fn label(self) -> &'static str {
@@ -32,6 +44,9 @@ impl TestPattern {
             TestPattern::Grid => "Grid",
             TestPattern::ColourBars => "Colour bars",
             TestPattern::ScannerTest => "Scanner test (tuning)",
+            TestPattern::Registration => "Calibration: registration",
+            TestPattern::DelayComb => "Calibration: colour delay comb",
+            TestPattern::JumpGrid => "Calibration: jump grid",
         }
     }
 
@@ -97,6 +112,44 @@ impl TestPattern {
                 ];
                 for i in 0..5 {
                     v.push(circle(-0.64 + i as f32 * 0.32, -0.55, 0.08, 24, Rgb::new(0.0, 1.0, 0.2)));
+                }
+                v
+            }
+            TestPattern::Registration => {
+                let w = Rgb::WHITE;
+                let mut v = vec![Path::new(
+                    vec![Vec2::new(-0.9, 0.9), Vec2::new(0.9, 0.9), Vec2::new(0.9, -0.9), Vec2::new(-0.9, -0.9)],
+                    true,
+                    w,
+                )];
+                // A mark near the top-left so the orientation is unambiguous.
+                v.push(line((-0.8, 0.8), (-0.6, 0.8), Rgb::new(1.0, 0.0, 0.0)));
+                v.push(line((-0.8, 0.8), (-0.8, 0.6), Rgb::new(1.0, 0.0, 0.0)));
+                v
+            }
+            TestPattern::DelayComb => {
+                let mut v = Vec::new();
+                for row in 0..8 {
+                    let y = 0.7 - row as f32 * 0.2;
+                    for k in 0..6 {
+                        let x0 = -0.8 + k as f32 * 0.28;
+                        let (a, b) = if row % 2 == 0 { ((x0, y), (x0 + 0.16, y)) } else { ((x0 + 0.16, y), (x0, y)) };
+                        let mut p = line(a, b, Rgb::new(0.0, 1.0, 0.0));
+                        p.fixed_start = true;
+                        v.push(p);
+                    }
+                }
+                v
+            }
+            TestPattern::JumpGrid => {
+                let mut v = Vec::new();
+                for i in 0..5 {
+                    for j in 0..5 {
+                        let (x, y) = (-0.72 + i as f32 * 0.36, 0.72 - j as f32 * 0.36);
+                        let mut p = line((x - 0.1, y), (x + 0.1, y), Rgb::new(0.0, 0.5, 1.0));
+                        p.fixed_start = true;
+                        v.push(p);
+                    }
                 }
                 v
             }

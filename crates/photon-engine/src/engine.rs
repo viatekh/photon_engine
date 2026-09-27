@@ -67,6 +67,9 @@ pub struct Shared {
     /// Set by the UI to start / stop recording; the pipeline thread does the work.
     pub record_requested: AtomicBool,
     pub recording: Mutex<RecordingStatus>,
+    pub camera: Mutex<crate::camera::CameraState>,
+    pub session: Mutex<crate::calibration::SessionStatus>,
+    pub session_abort: AtomicBool,
     /// Never persisted: the app always starts disarmed.
     pub armed: AtomicBool,
     pub shutdown: AtomicBool,
@@ -84,6 +87,9 @@ impl Shared {
             output_status: Mutex::new(OutputStatus::default()),
             record_requested: AtomicBool::new(false),
             recording: Mutex::new(RecordingStatus::default()),
+            camera: Mutex::new(Default::default()),
+            session: Mutex::new(Default::default()),
+            session_abort: AtomicBool::new(false),
             armed: AtomicBool::new(false),
             shutdown: AtomicBool::new(false),
             seq: AtomicU64::new(0),
@@ -98,7 +104,9 @@ impl Shared {
 pub fn start(shared: Arc<Shared>) -> Vec<thread::JoinHandle<()>> {
     let s1 = shared.clone();
     let s2 = shared;
+    let s3 = s2.clone();
     vec![
+        crate::camera::start(s3),
         thread::Builder::new().name("pipeline".into()).spawn(move || pipeline(s1)).unwrap(),
         thread::Builder::new().name("output".into()).spawn(move || output(s2)).unwrap(),
     ]

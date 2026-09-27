@@ -27,6 +27,10 @@ pub struct App {
     show_threshold: bool,
     edit_keystone: bool,
     dragging: Option<usize>,
+    cameras: Vec<crate::camera::CameraSelection>,
+    camera_note: String,
+    camera_tex: Option<egui::TextureHandle>,
+    camera_tex_at: Instant,
 }
 
 impl App {
@@ -49,6 +53,10 @@ impl App {
             show_threshold: true,
             edit_keystone: false,
             dragging: None,
+            cameras: Vec::new(),
+            camera_note: String::new(),
+            camera_tex: None,
+            camera_tex_at: Instant::now(),
         }
     }
 
@@ -59,7 +67,12 @@ impl App {
 
 impl eframe::App for App {
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
-        eframe::set_value(storage, SETTINGS_KEY, &*self.shared.settings.read());
+        // Mid-calibration the live settings are the session's; save the user's.
+        let original = self.shared.session.lock().original.clone();
+        match original {
+            Some(o) => eframe::set_value(storage, SETTINGS_KEY, &o),
+            None => eframe::set_value(storage, SETTINGS_KEY, &*self.shared.settings.read()),
+        }
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
@@ -312,6 +325,10 @@ impl App {
             });
         });
 
+        egui::CollapsingHeader::new("Camera & calibration").default_open(false).show(ui, |ui| {
+            self.camera_controls(ui, s);
+        });
+
         egui::CollapsingHeader::new("Keystone").default_open(true).show(ui, |ui| {
             ui.checkbox(&mut self.edit_keystone, "Edit corners (drag in the output preview)");
             for (i, name) in CORNER_NAMES.iter().enumerate() {
@@ -364,6 +381,80 @@ impl App {
                 geometry: s.geometry.clone(),
                 ..Default::default()
             };
+        }
+    }
+
+    fn camera_controls(&mut self, ui: &mut egui::Ui, s: &mut Settings) {
+        use crate::camera::{CameraSelection, CAM_H, CAM_W};
+        ui.small("A camera pointed at the projection surface (never into the beam) lets a calibration session measure the real laser output.");
+        ui.horizontal(|ui| {
+            egui::ComboBox::from_label("Camera")
+                .selected_text(s.camera.label())
+                .width(200.0)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut s.camera, CameraSelection::None, "None");
+                    ui.selectable_value(&mut s.camera, CameraSelection::Simulated, CameraSelection::Simulated.label());
+                    for c in &self.cameras {
+                        ui.selectable_value(&mut s.camera, c.clone(), c.label());
+                    }
+                });
+            if ui.button("⟳").on_hover_text("Find cameras (needs ffmpeg: brew install ffmpeg)").clicked() {
+                (self.cameras, self.camera_note) = crate::camera::list_devices();
+            }
+        });
+        if !self.camera_note.is_empty() {
+            ui.small(&self.camera_note);
+        }
+        let (latest, msg) = {
+            let st = self.shared.camera.lock();
+            (st.latest.clone(), st.message.clone())
+        };
+        if !msg.is_empty() {
+            ui.small(msg);
+        }
+        if let Some(f) = latest {
+            // Preview at ~10 fps, quarter resolution.
+            if self.camera_tex.is_none() || self.camera_tex_at.elapsed() > Duration::from_millis(100) {
+                self.camera_tex_at = Instant::now();
+                let (w, h) = (CAM_W / 3, CAM_H / 3);
+                let mut px = Vec::with_capacity(w * h);
+                for y in 0..h {
+                    for x in 0..w {
+                        let i = ((y * 3) * CAM_W + x * 3) * 3;
+                        px.push(Color32::from_rgb(f.rgb[i], f.rgb[i + 1], f.rgb[i + 2]));
+                    }
+                }
+                let img = egui::ColorImage::new([w, h], px);
+                match &mut self.camera_tex {
+                    Some(t) => t.set(img, egui::TextureOptions::LINEAR),
+                    None => self.camera_tex = Some(ui.ctx().load_texture("camera", img, egui::TextureOptions::LINEAR)),
+                }
+            }
+            if let Some(t) = &self.camera_tex {
+                ui.image((t.id(), EVec2::new(300.0, 300.0 * CAM_H as f32 / CAM_W as f32)));
+            }
+        }
+        let session = self.shared.session.lock().clone();
+        if session.running {
+            ui.label(format!("Calibrating: step {}/{} - {}", session.step, session.total, session.name));
+            ui.add(egui::ProgressBar::new(session.step as f32 / session.total.max(1) as f32));
+            if ui.button("Abort calibration").clicked() {
+                self.shared.session_abort.store(true, Ordering::SeqCst);
+            }
+        } else {
+            let armed = self.shared.armed.load(Ordering::SeqCst);
+            let ready = armed && s.camera != CameraSelection::None;
+            if ui
+                .add_enabled(ready, egui::Button::new("Run calibration session (~1 min)"))
+                .on_hover_text("Draws ~30 test patterns with different settings and records what the camera sees. Needs a camera and the laser armed. Your settings are restored afterwards.")
+                .on_disabled_hover_text("Select a camera and arm the laser first.")
+                .clicked()
+            {
+                crate::calibration::start(self.shared.clone());
+            }
+            if !session.message.is_empty() {
+                ui.small(&session.message);
+            }
         }
     }
 

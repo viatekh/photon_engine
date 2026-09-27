@@ -1,5 +1,8 @@
 //! Photon Engine: laser output from Syphon / NDI video.
 
+mod calib_analysis;
+mod calibration;
+mod camera;
 mod dac;
 mod engine;
 mod input;
@@ -11,6 +14,13 @@ mod ui;
 fn main() -> eframe::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let args: Vec<String> = std::env::args().collect();
+    if args.len() == 4 && args[1] == "--analyse-calibration" {
+        if let Err(e) = calib_analysis::run(&args[2], &args[3]) {
+            eprintln!("analysis failed: {e:#}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
     if args.len() == 4 && args[1] == "--replay" {
         if let Err(e) = replay::run(&args[2], &args[3]) {
             eprintln!("replay failed: {e:#}");

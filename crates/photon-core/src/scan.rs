@@ -337,7 +337,8 @@ fn order(paths: &[Path]) -> Vec<Choice> {
                 if ds < best.0 {
                     best = (ds, slot, false, 0);
                 }
-                if de < best.0 {
+                // A fixed-direction open path is only ever entered at its start.
+                if de < best.0 && !p.fixed_start {
                     best = (de, slot, true, 0);
                 }
             }

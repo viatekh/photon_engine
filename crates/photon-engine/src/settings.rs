@@ -1,5 +1,6 @@
 //! Everything the user can configure. Persisted between runs (except arming, which never is).
 
+use crate::camera::CameraSelection;
 use crate::dac::DacSelection;
 use crate::input::SourceSelection;
 use photon_core::detail::AutoDetailParams;
@@ -29,6 +30,8 @@ pub struct Settings {
     pub colour: ColourParams,
     pub geometry: OutputGeometry,
     pub dac: DacSelection,
+    /// Camera watching the laser output (calibration / development).
+    pub camera: CameraSelection,
     /// Blank if no new frame has arrived for this long.
     pub signal_timeout_ms: u32,
     /// Blank frames whose lit points all fall within this extent (a near-static beam).
@@ -48,6 +51,7 @@ impl Settings {
         Settings {
             source: self.source,
             dac: self.dac,
+            camera: self.camera,
             geometry: self.geometry,
             // v5: keep colour as tuned; scan tuning back to defaults (incl. scanner rating 30 -
             // low ratings were being used to hide flicker, which was really the refresh rate).
@@ -77,6 +81,7 @@ impl Default for Settings {
             colour: ColourParams::default(),
             geometry: OutputGeometry::default(),
             dac: DacSelection::Simulator,
+            camera: CameraSelection::None,
             signal_timeout_ms: 500,
             static_beam_min_extent: 0.05,
         }

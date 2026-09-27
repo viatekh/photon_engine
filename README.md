@@ -96,6 +96,24 @@ python3 tools/analyse_recording.py recordings/rec-123.jsonl.gz --sheet 100 16   
 cargo run --release -- --replay recordings/rec-123.jsonl.gz /tmp/after.jsonl.gz # re-run with current code
 ```
 
+## Camera calibration (measuring the real laser)
+
+For development: a webcam watching the projection lets me measure what the real laser does
+(mirror lag, overshoot, colour delay, settle time) instead of guessing.
+
+1. `brew install ffmpeg` (used to read the webcam).
+2. Point a USB webcam at the projection surface - **never into the beam**. Fixed on a stand,
+   whole projection in view, dim room.
+3. Left panel → **Camera & calibration** → ⟳ to list cameras → pick yours. The preview should
+   show the laser. (macOS will ask for camera permission for the Terminal the first time.)
+4. Arm the laser, click **Run calibration session**. It draws ~28 test patterns (≈1 minute),
+   restores your settings, and saves `recordings/calib-<time>.jsonl.gz`.
+5. Send that file (git push, as with recordings).
+
+`--analyse-calibration FILE OUT_DIR` aligns the camera to laser coordinates, writes overlays
+(commanded path in red over the camera image) and measures coverage / stray light per step.
+"Simulated (galvo model)" camera runs the whole flow without hardware.
+
 ## Safety behaviour
 
 * Always starts disarmed; arming is never saved. Space/Esc blacks out at once (the current frame is cut short).
