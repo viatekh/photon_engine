@@ -56,7 +56,7 @@ pub struct CameraState {
     pub frames: u64,
     /// Frames per second actually arriving.
     pub fps: f32,
-    /// Last thing ffmpeg printed (errors / warnings).
+    /// Last lines ffmpeg printed (errors / warnings).
     pub ffmpeg_log: String,
 }
 
@@ -113,10 +113,26 @@ fn set_msg(state: &Mutex<CameraState>, msg: impl Into<String>) {
     }
 }
 
+/// Capture settings tried in turn until the camera delivers frames. AVFoundation rejects any
+/// pixel format / frame rate / size the device doesn't list (ffmpeg's default pixel format,
+/// yuv420p, is rejected by most Mac webcams).
+const CONFIGS: &[(&str, &str, Option<&str>)] = &[
+    ("uyvy422", "30", None),
+    ("nv12", "30", None),
+    ("uyvy422", "30", Some("1280x720")),
+    ("nv12", "30", Some("1280x720")),
+    ("0rgb", "30", None),
+    ("bgr0", "30", None),
+    ("uyvy422", "15", Some("640x480")),
+    ("nv12", "15", Some("640x480")),
+];
+
 fn run(shared: Arc<Shared>) {
     let mut current = CameraSelection::None;
     let mut child: Option<Child> = None;
     let mut reader: Option<thread::JoinHandle<()>> = None;
+    let mut attempt = 0usize;
+    let mut frames_at_spawn = 0u64;
     let sim_warp = Homography::from_points(
         [Vec2::new(-1.0, 1.0), Vec2::new(1.0, 1.0), Vec2::new(1.0, -1.0), Vec2::new(-1.0, -1.0)],
         // A slightly off-axis camera view, in camera pixels.
@@ -126,18 +142,43 @@ fn run(shared: Arc<Shared>) {
 
     while !shared.shutdown.load(Ordering::Relaxed) {
         let wanted = shared.settings.read().camera.clone();
+        let mut respawn = false;
         if wanted != current {
-            if let Some(mut c) = child.take() {
-                let _ = c.kill();
-                let _ = c.wait();
+            stop(&mut child, &mut reader);
+            {
+                let mut st = shared.camera.lock();
+                st.latest = None;
+                st.fps = 0.0;
             }
-            if let Some(r) = reader.take() {
-                let _ = r.join();
-            }
-            shared.camera.lock().latest = None;
             current = wanted.clone();
+            attempt = 0;
+            respawn = matches!(current, CameraSelection::Device { .. });
+            if current == CameraSelection::None {
+                set_msg(&shared.camera, "");
+                shared.camera.lock().ffmpeg_log.clear();
+            }
+        }
+        if let (CameraSelection::Device { .. }, Some(c)) = (&current, child.as_mut()) {
+            if let Ok(Some(status)) = c.try_wait() {
+                stop(&mut child, &mut reader);
+                let got_frames = shared.camera.lock().frames > frames_at_spawn;
+                if !got_frames && attempt + 1 < CONFIGS.len() {
+                    attempt += 1;
+                    respawn = true;
+                } else {
+                    set_msg(
+                        &shared.camera,
+                        format!("ffmpeg stopped ({status}); check the camera and its permission (see messages below)"),
+                    );
+                }
+            }
+        }
+        if respawn {
             if let CameraSelection::Device { index, .. } = &current {
-                match spawn_ffmpeg(*index) {
+                let (pix, fps, size) = CONFIGS[attempt];
+                shared.camera.lock().ffmpeg_log.clear();
+                frames_at_spawn = shared.camera.lock().frames;
+                match spawn_ffmpeg(*index, pix, fps, size) {
                     Ok((mut c, r)) => {
                         if let Some(err) = c.stderr.take() {
                             let sh = shared.clone();
@@ -146,12 +187,17 @@ fn run(shared: Arc<Shared>) {
                         child = Some(c);
                         let sh = shared.clone();
                         reader = Some(thread::spawn(move || read_frames(sh, r)));
-                        set_msg(&shared.camera, format!("Capturing {}", current.label()));
+                        set_msg(
+                            &shared.camera,
+                            format!(
+                                "Capturing {} ({pix}, {fps} fps, {})",
+                                current.label(),
+                                size.unwrap_or("default size")
+                            ),
+                        );
                     }
                     Err(e) => set_msg(&shared.camera, format!("{e:#}")),
                 }
-            } else if current == CameraSelection::None {
-                set_msg(&shared.camera, "");
             }
         }
         match &current {
@@ -165,45 +211,51 @@ fn run(shared: Arc<Shared>) {
                 drop(st);
                 thread::sleep(Duration::from_millis(33));
             }
-            CameraSelection::Device { .. } => {
-                if let Some(c) = child.as_mut() {
-                    if let Ok(Some(status)) = c.try_wait() {
-                        set_msg(&shared.camera, format!("ffmpeg stopped ({status}); check the camera and permissions"));
-                        child = None;
-                    }
-                }
-                thread::sleep(Duration::from_millis(100));
-            }
-            CameraSelection::None => thread::sleep(Duration::from_millis(100)),
+            _ => thread::sleep(Duration::from_millis(100)),
         }
     }
-    if let Some(mut c) = child {
+    stop(&mut child, &mut reader);
+}
+
+fn stop(child: &mut Option<Child>, reader: &mut Option<thread::JoinHandle<()>>) {
+    if let Some(mut c) = child.take() {
         let _ = c.kill();
+        let _ = c.wait();
+    }
+    if let Some(r) = reader.take() {
+        let _ = r.join();
     }
 }
 
-fn spawn_ffmpeg(index: usize) -> anyhow::Result<(Child, std::process::ChildStdout)> {
-    // Webcams only accept frame rates they support; 30 is near universal, and ffmpeg's
-    // AVFoundation input picks the device's default size. Output is scaled to CAM_W x CAM_H.
+fn spawn_ffmpeg(
+    index: usize,
+    pix: &str,
+    fps: &str,
+    size: Option<&str>,
+) -> anyhow::Result<(Child, std::process::ChildStdout)> {
+    // Input options must match a mode the device lists; output is scaled to CAM_W x CAM_H RGB.
+    let mut args: Vec<String> = ["-hide_banner", "-loglevel", "error", "-f", "avfoundation"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    args.extend(["-pixel_format".into(), pix.into(), "-framerate".into(), fps.into()]);
+    if let Some(size) = size {
+        args.extend(["-video_size".into(), size.into()]);
+    }
+    args.extend([
+        "-i".into(),
+        format!("{index}:none"),
+        "-vf".into(),
+        format!("scale={CAM_W}:{CAM_H}"),
+        "-pix_fmt".into(),
+        "rgb24".into(),
+        "-f".into(),
+        "rawvideo".into(),
+        "-".into(),
+    ]);
+    log::info!("camera: ffmpeg {}", args.join(" "));
     let mut child = Command::new("ffmpeg")
-        .args([
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-f",
-            "avfoundation",
-            "-framerate",
-            "30",
-            "-i",
-            &format!("{index}:none"),
-            "-vf",
-            &format!("scale={CAM_W}:{CAM_H}"),
-            "-pix_fmt",
-            "rgb24",
-            "-f",
-            "rawvideo",
-            "-",
-        ])
+        .args(&args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -218,7 +270,12 @@ fn read_log(shared: Arc<Shared>, err: std::process::ChildStderr) {
     use std::io::BufRead;
     for line in std::io::BufReader::new(err).lines().map_while(Result::ok) {
         log::warn!("ffmpeg: {line}");
-        shared.camera.lock().ffmpeg_log = line;
+        // Keep the last few lines: ffmpeg's errors span several (e.g. the supported-mode list).
+        let mut st = shared.camera.lock();
+        let mut lines: Vec<&str> = st.ffmpeg_log.lines().collect();
+        lines.push(line.trim());
+        let keep = lines.len().saturating_sub(12);
+        st.ffmpeg_log = lines[keep..].join("\n");
     }
 }
 

@@ -422,7 +422,7 @@ impl App {
             ));
         }
         if !ff.is_empty() {
-            ui.colored_label(Color32::YELLOW, format!("ffmpeg: {ff}"));
+            ui.colored_label(Color32::YELLOW, format!("ffmpeg:\n{ff}"));
         }
         if let Some(f) = latest {
             // Preview at ~10 fps, quarter resolution.
