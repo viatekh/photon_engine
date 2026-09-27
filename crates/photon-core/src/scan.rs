@@ -11,10 +11,14 @@ use serde::{Deserialize, Serialize};
 pub struct ScanParams {
     /// Points per second sent to the DAC.
     pub pps: u32,
-    /// Max beam speed while lit. Faster = more content fits, but corners round off and the
+    /// Galvo rating in kpps at ILDA 8 degrees (e.g. 30 for "30K scanners"). Speeds and dwells
+    /// below are specified for a 30K scanner and scaled by `scanner_kpps / 30`, so changing
+    /// this one number retunes everything for faster or slower scanners.
+    pub scanner_kpps: f32,
+    /// Max beam speed while lit (at 30K). Faster = more content fits, but corners round off and the
     /// line dims. Units: field widths/2 per second.
     pub lit_speed: f32,
-    /// Max beam speed while blanked (jumping between shapes).
+    /// Max beam speed while blanked, jumping between shapes (at 30K).
     pub blank_speed: f32,
     /// Extra time at a full 180-degree corner (scaled down for gentler corners).
     pub corner_dwell_us: f32,
@@ -32,6 +36,7 @@ impl Default for ScanParams {
     fn default() -> Self {
         Self {
             pps: 30_000,
+            scanner_kpps: 30.0,
             lit_speed: 450.0,
             blank_speed: 1500.0,
             corner_dwell_us: 130.0,
@@ -44,14 +49,19 @@ impl Default for ScanParams {
 }
 
 impl ScanParams {
+    /// How much faster than a 30K scanner the galvos are.
+    fn scanner_factor(&self) -> f32 {
+        (self.scanner_kpps / 30.0).clamp(0.1, 10.0)
+    }
+    /// Dwell times shrink for faster scanners (they settle sooner).
     fn points_for(&self, us: f32) -> usize {
-        (us * 1e-6 * self.pps as f32).round().max(0.0) as usize
+        (us / self.scanner_factor() * 1e-6 * self.pps as f32).round().max(0.0) as usize
     }
     pub fn lit_step(&self) -> f32 {
-        (self.lit_speed / self.pps.max(1) as f32).max(1e-5)
+        (self.lit_speed * self.scanner_factor() / self.pps.max(1) as f32).max(1e-5)
     }
     pub fn blank_step(&self) -> f32 {
-        (self.blank_speed / self.pps.max(1) as f32).max(1e-5)
+        (self.blank_speed * self.scanner_factor() / self.pps.max(1) as f32).max(1e-5)
     }
     pub fn corner_points(&self) -> usize {
         self.points_for(self.corner_dwell_us)

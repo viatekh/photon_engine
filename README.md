@@ -109,6 +109,10 @@ cargo test --release -p photon-core --test pipeline -- --ignored --nocapture   #
   reported (only over WiFi), so the app can't show it. If the app is armed and streaming but the
   laser is dark, check the key/interlock.
 * **Syphon texture orientation**: if the image is upside down, tick *Flip input vertically*.
-* Scanner defaults (lit speed 450, blank speed 1500, dwells) are guesses for a LaserCube's
-  galvos and need tuning by eye.
+* **Two different "kpps" numbers:** *DAC point rate* (points/sec sent; sets the per-frame budget,
+  capped at what the cube reports) and *Scanner rating* (galvo speed, e.g. 30K at ILDA 8°, which
+  scales the lit/blank speeds and dwells). Both are under Output. The LaserCube's galvo rating
+  isn't published anywhere I could check: start at 30 and lower it if corners overshoot or
+  lines wobble. Wicked Lasers' own software treats the USB cube's max rate as its current rate,
+  so the max it reports may not be reliable.
 * Spout (Windows) is not implemented yet; the input layer is ready for it.

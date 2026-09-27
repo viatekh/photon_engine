@@ -241,6 +241,12 @@ impl App {
                         ui.selectable_value(&mut s.dac, d, d.label());
                     }
                 });
+            let max_pps = self.shared.output_status.lock().max_pps.max(1000);
+            let pps_max = max_pps.max(s.scan.pps);
+            ui.add(egui::Slider::new(&mut s.scan.pps, 1000..=pps_max).text("DAC point rate (pps)"))
+                .on_hover_text("Points per second sent to the DAC. Sets the per-frame point budget. Limited to what the device reports.");
+            ui.add(egui::Slider::new(&mut s.scan.scanner_kpps, 5.0..=60.0).text("Scanner rating (kpps)"))
+                .on_hover_text("Your galvos' rated speed at ILDA 8 degrees (e.g. 30 for 30K). Faster scanners can move further per point and need shorter dwells.");
             let c = &mut s.colour;
             ui.add(egui::Slider::new(&mut c.brightness, 0.0..=1.0).text("Brightness"));
             ui.add(egui::Slider::new(&mut c.red, 0.0..=1.0).text("Red"));
@@ -270,10 +276,8 @@ impl App {
         });
 
         egui::CollapsingHeader::new("Scanner tuning").default_open(false).show(ui, |ui| {
-            let max_pps = self.shared.output_status.lock().max_pps.max(1000);
             let sc = &mut s.scan;
-            let pps_max = max_pps.max(sc.pps);
-            ui.add(egui::Slider::new(&mut sc.pps, 1000..=pps_max).text("Points / sec"));
+            ui.small("Speeds and dwells are for a 30K scanner; the scanner rating above scales them.");
             ui.add(egui::Slider::new(&mut sc.lit_speed, 50.0..=2000.0).text("Lit speed"));
             ui.add(egui::Slider::new(&mut sc.blank_speed, 100.0..=5000.0).text("Blank speed"));
             ui.add(egui::Slider::new(&mut sc.corner_dwell_us, 0.0..=500.0).text("Corner dwell (µs)"));
