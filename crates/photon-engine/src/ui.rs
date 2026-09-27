@@ -405,12 +405,24 @@ impl App {
         if !self.camera_note.is_empty() {
             ui.small(&self.camera_note);
         }
-        let (latest, msg) = {
+        let (latest, msg, fps, frames, ff) = {
             let st = self.shared.camera.lock();
-            (st.latest.clone(), st.message.clone())
+            (st.latest.clone(), st.message.clone(), st.fps, st.frames, st.ffmpeg_log.clone())
         };
         if !msg.is_empty() {
             ui.small(msg);
+        }
+        if s.camera != CameraSelection::None {
+            let live = latest.as_ref().is_some_and(|f| f.at.elapsed() < Duration::from_millis(500));
+            ui.small(format!(
+                "{} - {:.0} fps, {} frames",
+                if live { "live" } else { "NOT receiving frames" },
+                fps,
+                frames
+            ));
+        }
+        if !ff.is_empty() {
+            ui.colored_label(Color32::YELLOW, format!("ffmpeg: {ff}"));
         }
         if let Some(f) = latest {
             // Preview at ~10 fps, quarter resolution.

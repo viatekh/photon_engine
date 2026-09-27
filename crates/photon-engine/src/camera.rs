@@ -54,6 +54,10 @@ pub struct CameraState {
     pub latest: Option<Arc<CamFrame>>,
     pub message: String,
     pub frames: u64,
+    /// Frames per second actually arriving.
+    pub fps: f32,
+    /// Last thing ffmpeg printed (errors / warnings).
+    pub ffmpeg_log: String,
 }
 
 /// Video devices ffmpeg can see (macOS AVFoundation). Empty with a note if ffmpeg is missing.
@@ -134,7 +138,11 @@ fn run(shared: Arc<Shared>) {
             current = wanted.clone();
             if let CameraSelection::Device { index, .. } = &current {
                 match spawn_ffmpeg(*index) {
-                    Ok((c, r)) => {
+                    Ok((mut c, r)) => {
+                        if let Some(err) = c.stderr.take() {
+                            let sh = shared.clone();
+                            thread::spawn(move || read_log(sh, err));
+                        }
                         child = Some(c);
                         let sh = shared.clone();
                         reader = Some(thread::spawn(move || read_frames(sh, r)));
@@ -152,6 +160,7 @@ fn run(shared: Arc<Shared>) {
                 let mut st = shared.camera.lock();
                 st.latest = Some(Arc::new(frame));
                 st.frames += 1;
+                st.fps = 30.0;
                 st.message = "Simulated camera".into();
                 drop(st);
                 thread::sleep(Duration::from_millis(33));
@@ -197,23 +206,42 @@ fn spawn_ffmpeg(index: usize) -> anyhow::Result<(Child, std::process::ChildStdou
         ])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
+        .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| anyhow::anyhow!("could not start ffmpeg ({e}); install with: brew install ffmpeg"))?;
     let out = child.stdout.take().unwrap();
     Ok((child, out))
 }
 
+/// Forward ffmpeg's messages to the log and the camera panel.
+fn read_log(shared: Arc<Shared>, err: std::process::ChildStderr) {
+    use std::io::BufRead;
+    for line in std::io::BufReader::new(err).lines().map_while(Result::ok) {
+        log::warn!("ffmpeg: {line}");
+        shared.camera.lock().ffmpeg_log = line;
+    }
+}
+
 fn read_frames(shared: Arc<Shared>, mut out: std::process::ChildStdout) {
     let size = CAM_W * CAM_H * 3;
+    let mut since = Instant::now();
+    let mut count = 0u32;
     loop {
         let mut buf = vec![0u8; size];
         if out.read_exact(&mut buf).is_err() {
+            log::warn!("camera: ffmpeg stream ended");
+            shared.camera.lock().fps = 0.0;
             return;
         }
+        count += 1;
         let mut st = shared.camera.lock();
         st.latest = Some(Arc::new(CamFrame { rgb: buf, at: Instant::now() }));
         st.frames += 1;
+        if since.elapsed() >= Duration::from_secs(1) {
+            st.fps = count as f32 / since.elapsed().as_secs_f32();
+            count = 0;
+            since = Instant::now();
+        }
     }
 }
 
