@@ -161,11 +161,14 @@ impl Dac for LaserCubeUsb {
         }
     }
 
+    fn recover(&mut self) -> anyhow::Result<()> {
+        LaserCubeUsb::recover(self)
+    }
+
     fn write(&mut self, points: &[LaserPoint]) -> anyhow::Result<()> {
-        // One bulk transfer per batch, as libLaserdockCore does (it sends up to 768 samples at
-        // once). Splitting into many small transfers costs a USB round trip each, which on macOS
-        // can be slow enough to let the cube's small buffer run dry (the beam then stalls).
-        for chunk in points.chunks(MAX_SAMPLES_PER_TRANSFER) {
+        // Transfers of the size the cube reports (bulk packet sample count), as in the version
+        // confirmed working on an LC-2000; the output loop sends several per batch.
+        for chunk in points.chunks(self.packet_samples.clamp(1, MAX_SAMPLES_PER_TRANSFER)) {
             self.bytes.clear();
             for p in chunk {
                 let c = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u16;
@@ -182,6 +185,15 @@ impl Dac for LaserCubeUsb {
         if let Some((buffered, _)) = &mut self.timed {
             *buffered += points.len() as f64;
         }
+        Ok(())
+    }
+}
+
+impl LaserCubeUsb {
+    /// Clear the cube's buffer and re-enable output (used by the output watchdog).
+    pub fn recover(&mut self) -> anyhow::Result<()> {
+        self.command(&[CMD_CLEAR_RINGBUFFER, 0])?;
+        self.command(&[CMD_SET_OUTPUT, 1])?;
         Ok(())
     }
 }

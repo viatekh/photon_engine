@@ -400,6 +400,17 @@ impl App {
             }
             ui.separator();
             ui.label(format!("Output {:.0} passes/s", out.frames_per_sec));
+            ui.separator();
+            let armed = self.shared.armed.load(Ordering::SeqCst);
+            let starved = armed && out.connected && out.sent_pps < 0.5 * self.shared.settings.read().scan.pps as f32;
+            ui.colored_label(
+                if starved { Color32::RED } else { ui.visuals().text_color() },
+                format!("Sent {:.1}k pts/s", out.sent_pps / 1000.0),
+            )
+            .on_hover_text(format!(
+                "Points actually delivered to the DAC per second. When armed this should match the point rate. DAC buffer free: {}. Watchdog recoveries: {}.",
+                out.dac_free, out.recoveries
+            ));
             if out.underruns > 0 {
                 ui.separator();
                 ui.colored_label(Color32::RED, format!("DAC underruns {}", out.underruns))

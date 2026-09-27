@@ -16,6 +16,10 @@ pub trait Dac: Send {
     /// How many points can be written right now without blocking.
     fn free_space(&mut self) -> anyhow::Result<usize>;
     fn write(&mut self, points: &[LaserPoint]) -> anyhow::Result<()>;
+    /// Try to unstick a device that stopped accepting points (clear buffer, re-enable).
+    fn recover(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

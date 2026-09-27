@@ -127,6 +127,12 @@ impl Recorder {
             "armed": armed,
             "out_blank": output.blanked_reason,
             "out_passes": output.frames_per_sec,
+            "out_sent_pps": output.sent_pps,
+            "out_dac_free": output.dac_free,
+            "out_underruns": output.underruns,
+            "out_recoveries": output.recoveries,
+            "out_connected": output.connected,
+            "out_message": output.message,
             "stats": {
                 "input_paths": st.input_paths, "drawn_paths": st.drawn_paths,
                 "input_shapes": st.input_shapes, "drawn_shapes": st.drawn_shapes,

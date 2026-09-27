@@ -48,6 +48,12 @@ pub struct OutputStatus {
     pub frames_per_sec: f32,
     /// Times the device buffer was found empty while streaming (the beam stalls). Should be 0.
     pub underruns: u64,
+    /// Points actually written to the DAC per second (should match the point rate when armed).
+    pub sent_pps: f32,
+    /// Last reported free space in the DAC buffer.
+    pub dac_free: usize,
+    /// Times the watchdog had to unstick the DAC.
+    pub recoveries: u64,
 }
 
 pub struct Shared {
@@ -418,6 +424,9 @@ fn output(shared: Arc<Shared>) {
     // again after we've been streaming a while means the buffer ran dry.
     let mut max_free = 0usize;
     let mut streaming_since: Option<Instant> = None;
+    // Watchdog: when armed, the DAC must keep accepting points.
+    let mut last_write = Instant::now();
+    let mut sent = 0usize;
 
     while !shared.shutdown.load(Ordering::Relaxed) {
         let settings = shared.settings.read().clone();
@@ -442,6 +451,7 @@ fn output(shared: Arc<Shared>) {
                     dac = Some(d);
                     max_free = 0;
                     streaming_since = None;
+                    last_write = Instant::now();
                     applied_pps = 0;
                     enabled = None;
                 }
@@ -475,13 +485,24 @@ fn output(shared: Arc<Shared>) {
             // Top the device buffer up whenever a useful amount of room appears, in one batch.
             // (The LaserCube's USB buffer is small - libLaserdockCore treats it as 768 points,
             // ~25 ms at 30k - so letting it drain between small writes causes stalls.)
+            shared.output_status.lock().dac_free = free;
             if free < 64 {
+                // Disarmed, the device's output is switched off and it stops consuming - fine.
+                // Armed, it must keep taking points; if it hasn't for a while, unstick it.
+                if want && last_write.elapsed() > Duration::from_millis(500) {
+                    log::warn!("DAC stopped accepting points (free {free}); clearing buffer and re-enabling");
+                    d.recover()?;
+                    shared.output_status.lock().recoveries += 1;
+                    last_write = Instant::now();
+                }
                 thread::sleep(Duration::from_millis(1));
                 return Ok(());
             }
             buf.clear();
             player.fill(&shared, &settings, free.min(1024), &mut buf);
             d.write(&buf)?;
+            sent += buf.len();
+            last_write = Instant::now();
             streaming_since.get_or_insert_with(Instant::now);
             Ok(())
         })();
@@ -500,6 +521,8 @@ fn output(shared: Arc<Shared>) {
         if el >= Duration::from_millis(250) {
             let mut st = shared.output_status.lock();
             st.frames_per_sec = st.frames_per_sec * 0.8 + 0.2 * player.frames_played as f32 / el.as_secs_f32();
+            st.sent_pps = sent as f32 / el.as_secs_f32();
+            sent = 0;
             st.blanked_reason = player.blanked;
             player.frames_played = 0;
             stats_since = Instant::now();
