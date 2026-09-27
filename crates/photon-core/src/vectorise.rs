@@ -35,6 +35,8 @@ pub struct VectoriseParams {
     pub threshold: f32,
     /// Longest side of the working image in pixels. Higher = more detail, slower, noisier.
     pub resolution: usize,
+    /// Smoothing passes applied before simplifying (removes pixel staircase).
+    pub smoothing: u32,
     /// Douglas-Peucker tolerance in working-image pixels.
     pub simplify_px: f32,
     /// Paths shorter than this (working-image pixels) are dropped as noise.
@@ -50,6 +52,7 @@ impl Default for VectoriseParams {
             fit: FitMode::Fit,
             threshold: 0.3,
             resolution: 240,
+            smoothing: 2,
             simplify_px: 0.6,
             min_length_px: 6.0,
             normalise_colour: true,
@@ -68,6 +71,7 @@ pub fn vectorise(img: &WorkImage, params: &VectoriseParams) -> Vec<Path> {
     let mapper = PixelMapper::new(img.width, img.height, params.fit);
     raw.into_iter()
         .filter_map(|(pts, closed)| {
+            let pts = smooth(&pts, closed, params.smoothing);
             let pts = simplify(&pts, closed, params.simplify_px);
             let min_pts = if closed { 3 } else { 2 };
             if pts.len() < min_pts {
@@ -431,7 +435,31 @@ fn thin(m: &mut [bool], w: usize, h: usize) {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Simplification.
+// Smoothing and simplification.
+
+/// Repeated 1-2-1 averaging of vertices. Open paths keep their end points.
+pub fn smooth(pts: &[Vec2], closed: bool, passes: u32) -> Vec<Vec2> {
+    let n = pts.len();
+    if n < 3 {
+        return pts.to_vec();
+    }
+    let mut cur = pts.to_vec();
+    let mut next = cur.clone();
+    for _ in 0..passes {
+        for i in 0..n {
+            let (prev, nxt) = if closed {
+                ((i + n - 1) % n, (i + 1) % n)
+            } else if i == 0 || i == n - 1 {
+                (i, i)
+            } else {
+                (i - 1, i + 1)
+            };
+            next[i] = (cur[prev] + cur[i] * 2.0 + cur[nxt]) * 0.25;
+        }
+        std::mem::swap(&mut cur, &mut next);
+    }
+    cur
+}
 
 /// Douglas-Peucker. For closed paths the first point is not repeated at the end.
 pub fn simplify(pts: &[Vec2], closed: bool, epsilon: f32) -> Vec<Vec2> {

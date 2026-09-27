@@ -3,6 +3,20 @@ name = "photon-engine"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "Laser output from Syphon / NDI video."
+build = "build.rs"
 
 [dependencies]
 photon-core = { path = "../photon-core" }
+eframe = { version = "0.36", default-features = false, features = ["glow", "persistence", "default_fonts", "wayland", "x11"] }
+egui = "0.36"
+rusb = { version = "0.9", features = ["vendored"] }
+libloading = "0.9"
+serde = { version = "1", features = ["derive"] }
+parking_lot = "0.12"
+anyhow = "1"
+log = "0.4"
+env_logger = "0.11"
+
+[build-dependencies]
+cc = "1"
