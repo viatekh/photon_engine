@@ -1,6 +1,7 @@
 //! Photon Engine core: everything between "a video frame arrived" and "points for the DAC",
 //! with no platform or hardware dependencies.
 
+pub mod detail;
 pub mod geom;
 pub mod image;
 pub mod keystone;

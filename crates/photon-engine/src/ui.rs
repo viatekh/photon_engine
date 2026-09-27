@@ -87,7 +87,8 @@ impl eframe::App for App {
         egui::Panel::left("controls").resizable(true).default_size(340.0).show(ui, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| self.controls(ui, &mut settings));
         });
-        egui::Panel::bottom("stats").show(ui, |ui| self.stats(ui));
+        let auto = settings.auto_detail.enabled;
+        egui::Panel::bottom("stats").show(ui, |ui| self.stats(ui, auto));
         egui::CentralPanel::default().show(ui, |ui| self.previews(ui, &mut settings));
 
         if settings != before {
@@ -158,21 +159,45 @@ impl App {
 
         egui::CollapsingHeader::new("Tracing").default_open(true).show(ui, |ui| {
             let v = &mut s.vectorise;
-            ui.horizontal(|ui| {
-                ui.selectable_value(&mut v.mode, TraceMode::Centreline, "Centreline")
-                    .on_hover_text("Follow the middle of lines. Best for laser-style line content.");
-                ui.selectable_value(&mut v.mode, TraceMode::Outline, "Outline")
-                    .on_hover_text("Trace the edges of bright areas. Works for any content.");
+            egui::ComboBox::from_label("Mode")
+                .selected_text(v.mode.label())
+                .width(220.0)
+                .show_ui(ui, |ui| {
+                    for m in TraceMode::ALL {
+                        ui.selectable_value(&mut v.mode, m, m.label());
+                    }
+                });
+            ui.small(match v.mode {
+                TraceMode::Edges => "Line art from contrast edges. Use for films, photos, fractals - anything.",
+                TraceMode::Centreline => "Follows the middle of bright lines. Best for laser-style line content.",
+                TraceMode::Outline => "Traces the edges of bright areas above the threshold.",
             });
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut v.fit, FitMode::Fit, "Fit (keep aspect)");
                 ui.selectable_value(&mut v.fit, FitMode::Stretch, "Stretch");
             });
-            ui.add(egui::Slider::new(&mut v.threshold, 0.02..=0.98).text("Threshold"));
+            if v.mode == TraceMode::Edges {
+                ui.add(egui::Slider::new(&mut v.edge_threshold, 0.02..=0.8).text("Edge threshold"));
+                ui.add(egui::Slider::new(&mut v.blur_px, 0.0..=4.0).text("Blur (px)"))
+                    .on_hover_text("Higher ignores fine texture and keeps bold structure.");
+            } else {
+                ui.add(egui::Slider::new(&mut v.threshold, 0.02..=0.98).text("Threshold"));
+            }
+            ui.add(egui::Slider::new(&mut v.temporal_smoothing, 0.0..=0.9).text("Temporal smoothing"))
+                .on_hover_text("Blend with previous frames to reduce flicker on video. Too high smears motion.");
             ui.add(egui::Slider::new(&mut v.resolution, 64..=480).text("Resolution (px)"));
             ui.add(egui::Slider::new(&mut v.smoothing, 0..=8).text("Smoothing"));
             ui.add(egui::Slider::new(&mut v.simplify_px, 0.0..=4.0).text("Simplify (px)"));
             ui.add(egui::Slider::new(&mut v.min_length_px, 0.0..=40.0).text("Min length (px)"));
+            ui.separator();
+            let a = &mut s.auto_detail;
+            ui.checkbox(&mut a.enabled, "Auto detail (fit content to scan budget)")
+                .on_hover_text("Continuously raises/lowers edge threshold and min length so busy content keeps its strongest structure instead of being culled at random.");
+            ui.add_enabled_ui(a.enabled, |ui| {
+                ui.add(egui::Slider::new(&mut a.target_fill, 0.3..=1.0).text("Target fill"));
+                ui.add(egui::Slider::new(&mut a.speed, 0.05..=1.0).text("Response speed"));
+            });
+            let v = &mut s.vectorise;
             ui.checkbox(&mut v.normalise_colour, "Full-brightness colours");
         });
 
@@ -262,14 +287,33 @@ impl App {
                 s.scan = Default::default();
             }
         });
+
+        ui.separator();
+        if ui
+            .button("Reset all settings")
+            .on_hover_text("Back to defaults. Keeps source, device, keystone and flips.")
+            .clicked()
+        {
+            *s = Settings {
+                source: s.source.clone(),
+                dac: s.dac,
+                geometry: s.geometry.clone(),
+                ..Default::default()
+            };
+        }
     }
 
-    fn stats(&self, ui: &mut egui::Ui) {
+    fn stats(&self, ui: &mut egui::Ui, s_auto: bool) {
         let plan = self.shared.plan.lock().clone();
         let inp = self.shared.input_status.lock().clone();
         let out = self.shared.output_status.lock().clone();
         ui.horizontal_wrapped(|ui| {
             ui.label(format!("Input {:.0} fps, {:.1} ms/frame", inp.fps, inp.process_ms));
+            if s_auto {
+                ui.separator();
+                ui.label(format!("Detail level {:.2}", inp.detail_level))
+                    .on_hover_text("1.0 = your settings. Above 1 = auto detail is reducing detail to fit.");
+            }
             if let Some(p) = plan {
                 let st = &p.plan.stats;
                 ui.separator();
@@ -319,7 +363,7 @@ impl App {
             if p.seq != self.preview_seq {
                 self.preview_seq = p.seq;
                 let img = &p.image;
-                let thr = s.vectorise.threshold;
+                let thr = if s.vectorise.mode == TraceMode::Edges { 0.0 } else { s.vectorise.threshold };
                 let pixels = img
                     .pixels
                     .iter()

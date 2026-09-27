@@ -2,6 +2,7 @@
 
 use crate::dac::DacSelection;
 use crate::input::SourceSelection;
+use photon_core::detail::AutoDetailParams;
 use photon_core::keystone::OutputGeometry;
 use photon_core::output::ColourParams;
 use photon_core::patterns::TestPattern;
@@ -18,6 +19,7 @@ pub struct Settings {
     pub test_pattern_on: bool,
     pub test_pattern: TestPattern,
     pub vectorise: VectoriseParams,
+    pub auto_detail: AutoDetailParams,
     pub planner: PlannerParams,
     pub scan: ScanParams,
     pub colour: ColourParams,
@@ -37,6 +39,7 @@ impl Default for Settings {
             test_pattern_on: true,
             test_pattern: TestPattern::Frame,
             vectorise: VectoriseParams::default(),
+            auto_detail: AutoDetailParams::default(),
             planner: PlannerParams::default(),
             scan: ScanParams::default(),
             colour: ColourParams::default(),

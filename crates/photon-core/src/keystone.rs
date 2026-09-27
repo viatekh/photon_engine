@@ -44,7 +44,9 @@ impl OutputGeometry {
                     h.apply(v)
                 })
                 .collect();
-            clip_path(&Path::new(pts, p.closed, p.color), &mut out);
+            let mut q = Path::new(pts, p.closed, p.color);
+            q.weight = p.weight;
+            clip_path(&q, &mut out);
         }
         out
     }
@@ -117,7 +119,9 @@ pub fn clip_path(path: &Path, out: &mut Vec<Path>) {
     let mut current: Vec<Vec2> = Vec::new();
     let flush = |current: &mut Vec<Vec2>, out: &mut Vec<Path>| {
         if current.len() >= 2 {
-            out.push(Path::new(std::mem::take(current), false, path.color));
+            let mut piece = Path::new(std::mem::take(current), false, path.color);
+            piece.weight = path.weight;
+            out.push(piece);
         }
         current.clear();
     };

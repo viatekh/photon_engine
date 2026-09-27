@@ -93,11 +93,13 @@ pub struct Path {
     /// A closed path returns to its first point.
     pub closed: bool,
     pub color: Rgb,
+    /// Importance of the path per unit length (edge strength or brightness), used for culling.
+    pub weight: f32,
 }
 
 impl Path {
     pub fn new(points: Vec<Vec2>, closed: bool, color: Rgb) -> Self {
-        Self { points, closed, color }
+        Self { points, closed, color, weight: 1.0 }
     }
 
     /// Drawn length, including the closing segment of a closed path.

@@ -8,18 +8,62 @@ use std::time::{Duration, Instant};
 const W: usize = 960;
 const H: usize = 540;
 
+#[derive(Clone, Copy)]
+pub enum DemoKind {
+    Rings,
+    /// Continuous Mandelbrot zoom: endlessly intricate detail.
+    Fractal,
+}
+
 pub struct DemoSource {
+    kind: DemoKind,
     start: Instant,
     next: Instant,
     buf: Vec<u8>,
 }
 
 impl DemoSource {
-    pub fn new() -> Self {
-        Self { start: Instant::now(), next: Instant::now(), buf: vec![0; W * H * 4] }
+    pub fn new(kind: DemoKind) -> Self {
+        Self { kind, start: Instant::now(), next: Instant::now(), buf: vec![0; W * H * 4] }
+    }
+
+    fn draw_fractal(&mut self, t: f32) {
+        // Zoom in for 30 s then start again. Rendered at half resolution to keep it cheap.
+        let zoom = 1.25f64.powf((t % 30.0) as f64);
+        let (cx, cy) = (-0.743_643_887_037_151f64, 0.131_825_904_205_33f64);
+        let (hw, hh) = (W / 2, H / 2);
+        let scale = 3.0 / (hw as f64 * zoom);
+        let max_iter = 120 + (zoom.log2() * 12.0) as u32;
+        for py in 0..hh {
+            for px in 0..hw {
+                let x0 = cx + (px as f64 - hw as f64 / 2.0) * scale;
+                let y0 = cy + (py as f64 - hh as f64 / 2.0) * scale;
+                let (mut x, mut y, mut i) = (0.0f64, 0.0f64, 0u32);
+                while x * x + y * y < 4.0 && i < max_iter {
+                    let tmp = x * x - y * y + x0;
+                    y = 2.0 * x * y + y0;
+                    x = tmp;
+                    i += 1;
+                }
+                let c = if i == max_iter {
+                    [0, 0, 0]
+                } else {
+                    let f = i as f32 * 0.1 + t * 0.5;
+                    let ch = |o: f32| ((0.5 + 0.5 * (f + o).sin()) * 255.0) as u8;
+                    [ch(0.0), ch(2.1), ch(4.2)]
+                };
+                for (dy, dx) in [(0, 0), (0, 1), (1, 0), (1, 1)] {
+                    let k = ((py * 2 + dy) * W + px * 2 + dx) * 4;
+                    self.buf[k..k + 4].copy_from_slice(&[c[0], c[1], c[2], 255]);
+                }
+            }
+        }
     }
 
     fn draw(&mut self, t: f32) {
+        if let DemoKind::Fractal = self.kind {
+            return self.draw_fractal(t);
+        }
         self.buf.fill(0);
         let buf = &mut self.buf;
         let mut plot = |x: f32, y: f32, c: [u8; 3]| {

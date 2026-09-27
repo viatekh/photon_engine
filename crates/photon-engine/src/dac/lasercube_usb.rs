@@ -5,6 +5,8 @@
 //!   (response[1] == 0 means success, u32 values little-endian from response[2]).
 //! * interface 1 (alt setting 1), bulk endpoint 0x03: samples, 8 bytes each:
 //!   u16 rg (red low byte, green high byte), u16 b, u16 x, u16 y (12-bit, 0..4095).
+//!   X is mirrored (libLaserdockCore sends `4095 - x`), so +x in laser space is to the right.
+//! * The interlock state is not reported over USB (only over the WiFi protocol).
 
 use super::Dac;
 use anyhow::{bail, Context};
@@ -93,7 +95,7 @@ impl LaserCubeUsb {
             log::warn!("LaserCube did not report ring buffer space; pacing output by time");
             dev.timed = Some((0.0, Instant::now()));
         }
-        let _ = dev.command(&[CMD_CLEAR_RINGBUFFER]);
+        let _ = dev.command(&[CMD_CLEAR_RINGBUFFER, 0]);
         log::info!(
             "LaserCube USB fw {}.{}, max {} pps, DAC range {}..{}, ring buffer {}, {} samples/packet",
             dev.version.0, dev.version.1, dev.max_pps, dev.dac_min, dev.dac_max, buffer, dev.packet_samples
@@ -162,7 +164,7 @@ impl Dac for LaserCubeUsb {
             for p in chunk {
                 let c = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u16;
                 let rg = c(p.r) | (c(p.g) << 8);
-                for v in [rg, c(p.b), self.to_dac(p.x), self.to_dac(p.y)] {
+                for v in [rg, c(p.b), self.to_dac(-p.x), self.to_dac(p.y)] {
                     self.bytes.extend_from_slice(&v.to_le_bytes());
                 }
             }
@@ -182,7 +184,7 @@ impl Drop for LaserCubeUsb {
     fn drop(&mut self) {
         // Leave the device dark and idle.
         let _ = self.command(&[CMD_SET_OUTPUT, 0]);
-        let _ = self.command(&[CMD_CLEAR_RINGBUFFER]);
+        let _ = self.command(&[CMD_CLEAR_RINGBUFFER, 0]);
         let _ = self.handle.release_interface(1);
         let _ = self.handle.release_interface(0);
     }

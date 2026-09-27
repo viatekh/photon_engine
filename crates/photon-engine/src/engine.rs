@@ -6,6 +6,7 @@ use crate::dac::{Dac, DacSelection};
 use crate::input::{SourceSelection, VideoSource};
 use crate::settings::Settings;
 use parking_lot::{Mutex, RwLock};
+use photon_core::detail::AutoDetail;
 use photon_core::image::WorkImage;
 use photon_core::output::{blank_frame, is_static_beam};
 use photon_core::planner::{Plan, Planner};
@@ -33,6 +34,8 @@ pub struct InputStatus {
     pub message: String,
     pub fps: f32,
     pub process_ms: f32,
+    /// Auto-detail level (1.0 = settings as set; higher = detail being reduced).
+    pub detail_level: f32,
 }
 
 #[derive(Clone, Default)]
@@ -91,6 +94,8 @@ pub fn start(shared: Arc<Shared>) -> Vec<thread::JoinHandle<()>> {
 
 fn pipeline(shared: Arc<Shared>) {
     let mut planner = Planner::new();
+    let mut detail = AutoDetail::default();
+    let mut previous: Option<WorkImage> = None;
     let mut source: Option<Box<dyn VideoSource>> = None;
     let mut source_sel = SourceSelection::None;
     let mut retry_at = Instant::now();
@@ -103,6 +108,7 @@ fn pipeline(shared: Arc<Shared>) {
         // (Re)connect the source when the selection changes or after an error.
         if settings.source != source_sel {
             source = None;
+            previous = None;
             source_sel = settings.source.clone();
             retry_at = Instant::now();
         }
@@ -137,7 +143,7 @@ fn pipeline(shared: Arc<Shared>) {
         let mut result = None;
         let received = src.receive(Duration::from_millis(100), &mut |f| {
             let t0 = Instant::now();
-            let image = WorkImage::from_frame(
+            let mut image = WorkImage::from_frame(
                 f.data,
                 f.width,
                 f.height,
@@ -146,9 +152,23 @@ fn pipeline(shared: Arc<Shared>) {
                 settings.vectorise.resolution,
                 settings.flip_input_y,
             );
-            let paths = vectorise(&image, &settings.vectorise);
+            // Temporal smoothing: blend with the previous frame to steady edges on video.
+            let a = settings.vectorise.temporal_smoothing.clamp(0.0, 0.95);
+            if let Some(prev) = &previous {
+                if a > 0.0 && prev.width == image.width && prev.height == image.height {
+                    for (c, p) in image.pixels.iter_mut().zip(&prev.pixels) {
+                        c.r = c.r * (1.0 - a) + p.r * a;
+                        c.g = c.g * (1.0 - a) + p.g * a;
+                        c.b = c.b * (1.0 - a) + p.b * a;
+                    }
+                }
+            }
+            let vp = detail.apply(&settings.vectorise, &settings.auto_detail);
+            let paths = vectorise(&image, &vp);
             let paths = settings.geometry.apply(&paths);
             let plan = planner.plan(paths, &settings.scan, &settings.planner);
+            detail.update(&plan.stats, &settings.auto_detail);
+            previous = Some(image.clone());
             result = Some((image, plan, t0.elapsed()));
         });
         match received {
@@ -166,6 +186,7 @@ fn pipeline(shared: Arc<Shared>) {
                     let el = fps_since.elapsed().as_secs_f32();
                     let mut st = shared.input_status.lock();
                     st.process_ms = st.process_ms * 0.9 + took.as_secs_f32() * 1000.0 * 0.1;
+                    st.detail_level = detail.level;
                     if el >= 1.0 {
                         st.fps = frames as f32 / el;
                         frames = 0;

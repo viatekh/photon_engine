@@ -1,6 +1,9 @@
 //! Turning a raster frame into laser paths.
 //!
-//! Two tracing modes:
+//! Three tracing modes:
+//! * **Edges** finds contrast edges (Canny-style: blur, gradient, non-max suppression,
+//!   hysteresis) and follows them. Works on any content - film, photos, fractals - producing
+//!   line art. Each path gets a weight from its edge strength so weak detail is culled first.
 //! * **Outline** traces the boundary of every bright region (marching squares, sub-pixel).
 //!   Robust for any content, but a thin line becomes a thin loop, which costs twice the scan time.
 //! * **Centreline** thins bright regions to a 1px skeleton (Zhang-Suen) and follows it.
@@ -13,8 +16,21 @@ use std::collections::HashMap;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TraceMode {
+    Edges,
     Outline,
     Centreline,
+}
+
+impl TraceMode {
+    pub const ALL: [TraceMode; 3] = [TraceMode::Edges, TraceMode::Centreline, TraceMode::Outline];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            TraceMode::Edges => "Edges (any content)",
+            TraceMode::Centreline => "Centreline (line content)",
+            TraceMode::Outline => "Outline (bright shapes)",
+        }
+    }
 }
 
 /// How the (usually 16:9) input maps onto the (square) laser field.
@@ -31,8 +47,14 @@ pub enum FitMode {
 pub struct VectoriseParams {
     pub mode: TraceMode,
     pub fit: FitMode,
-    /// Brightness (0..1) above which a pixel counts as "on".
+    /// Brightness (0..1) above which a pixel counts as "on" (Centreline / Outline).
     pub threshold: f32,
+    /// Edge strength (brightness change across the edge, 0..1) needed to start an edge (Edges).
+    pub edge_threshold: f32,
+    /// Gaussian blur before edge detection, in working-image pixels. Suppresses fine texture.
+    pub blur_px: f32,
+    /// 0..0.95: blend each frame with the previous to calm flickering edges on video.
+    pub temporal_smoothing: f32,
     /// Longest side of the working image in pixels. Higher = more detail, slower, noisier.
     pub resolution: usize,
     /// Smoothing passes applied before simplifying (removes pixel staircase).
@@ -48,9 +70,12 @@ pub struct VectoriseParams {
 impl Default for VectoriseParams {
     fn default() -> Self {
         Self {
-            mode: TraceMode::Centreline,
+            mode: TraceMode::Edges,
             fit: FitMode::Fit,
             threshold: 0.3,
+            edge_threshold: 0.12,
+            blur_px: 1.0,
+            temporal_smoothing: 0.3,
             resolution: 240,
             smoothing: 2,
             simplify_px: 0.6,
@@ -64,9 +89,16 @@ pub fn vectorise(img: &WorkImage, params: &VectoriseParams) -> Vec<Path> {
     if img.width < 2 || img.height < 2 {
         return Vec::new();
     }
+    let mut edges = None;
     let raw = match params.mode {
         TraceMode::Outline => trace_outlines(img, params.threshold),
         TraceMode::Centreline => trace_centrelines(img, params.threshold),
+        TraceMode::Edges => {
+            let e = detect_edges(img, params.blur_px, params.edge_threshold);
+            let paths = trace_skeleton(e.mask.clone(), img.width + 2, img.height + 2);
+            edges = Some(e);
+            paths
+        }
     };
     let mapper = PixelMapper::new(img.width, img.height, params.fit);
     raw.into_iter()
@@ -81,7 +113,13 @@ pub fn vectorise(img: &WorkImage, params: &VectoriseParams) -> Vec<Path> {
             if pixel_path.length() < params.min_length_px {
                 return None;
             }
-            let mut color = sample_colour(img, &pixel_path.points, params.threshold);
+            let (mut color, weight) = match &edges {
+                Some(e) => (sample_edge_colour(img, &pixel_path.points), e.mean_strength(&pixel_path.points)),
+                None => {
+                    let c = sample_colour(img, &pixel_path.points, params.threshold);
+                    (c, c.max_channel())
+                }
+            };
             if params.normalise_colour {
                 let m = color.max_channel();
                 if m > 0.0 {
@@ -92,7 +130,9 @@ pub fn vectorise(img: &WorkImage, params: &VectoriseParams) -> Vec<Path> {
                 return None;
             }
             let points = pixel_path.points.iter().map(|&p| mapper.map(p)).collect();
-            Some(Path::new(points, closed, color))
+            let mut path = Path::new(points, closed, color);
+            path.weight = weight;
+            Some(path)
         })
         .collect()
 }
@@ -145,6 +185,161 @@ fn sample_colour(img: &WorkImage, pts: &[Vec2], threshold: f32) -> Rgb {
         return Rgb::BLACK;
     }
     sum.scale(1.0 / n as f32)
+}
+
+/// Colour of the brighter side of an edge: the brightest pixel around each vertex.
+fn sample_edge_colour(img: &WorkImage, pts: &[Vec2]) -> Rgb {
+    let mut sum = Rgb::BLACK;
+    let mut n = 0usize;
+    for p in pts {
+        let cx = p.x.floor() as isize;
+        let cy = p.y.floor() as isize;
+        let mut best = Rgb::BLACK;
+        for y in (cy - 1).max(0)..=(cy + 1).min(img.height as isize - 1) {
+            for x in (cx - 1).max(0)..=(cx + 1).min(img.width as isize - 1) {
+                let c = img.get(x as usize, y as usize);
+                if c.max_channel() > best.max_channel() {
+                    best = c;
+                }
+            }
+        }
+        sum = Rgb::new(sum.r + best.r, sum.g + best.g, sum.b + best.b);
+        n += 1;
+    }
+    if n == 0 { Rgb::BLACK } else { sum.scale(1.0 / n as f32) }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Edge detection (Canny-style).
+
+pub struct EdgeMap {
+    /// Padded (width + 2) x (height + 2) mask of edge pixels.
+    pub mask: Vec<bool>,
+    /// Unpadded gradient magnitude (0..~1.4, 1.0 = a full black-to-white step).
+    pub strength: Vec<f32>,
+    pub width: usize,
+    pub height: usize,
+}
+
+impl EdgeMap {
+    /// Mean edge strength under a pixel-space polyline.
+    pub fn mean_strength(&self, pts: &[Vec2]) -> f32 {
+        let mut sum = 0.0;
+        for p in pts {
+            let x = (p.x.floor().max(0.0) as usize).min(self.width - 1);
+            let y = (p.y.floor().max(0.0) as usize).min(self.height - 1);
+            sum += self.strength[y * self.width + x];
+        }
+        if pts.is_empty() { 0.0 } else { sum / pts.len() as f32 }
+    }
+}
+
+pub fn detect_edges(img: &WorkImage, blur_px: f32, high: f32) -> EdgeMap {
+    let (w, h) = (img.width, img.height);
+    let mut v: Vec<f32> = (0..w * h).map(|i| img.pixels[i].max_channel()).collect();
+    gaussian_blur(&mut v, w, h, blur_px);
+
+    let at = |x: isize, y: isize| {
+        let x = x.clamp(0, w as isize - 1) as usize;
+        let y = y.clamp(0, h as isize - 1) as usize;
+        v[y * w + x]
+    };
+    let mut mag = vec![0.0f32; w * h];
+    let mut dir = vec![(0i8, 0i8); w * h];
+    for y in 0..h as isize {
+        for x in 0..w as isize {
+            let gx = (at(x + 1, y - 1) + 2.0 * at(x + 1, y) + at(x + 1, y + 1))
+                - (at(x - 1, y - 1) + 2.0 * at(x - 1, y) + at(x - 1, y + 1));
+            let gy = (at(x - 1, y + 1) + 2.0 * at(x, y + 1) + at(x + 1, y + 1))
+                - (at(x - 1, y - 1) + 2.0 * at(x, y - 1) + at(x + 1, y - 1));
+            let m = (gx * gx + gy * gy).sqrt() / 4.0;
+            let i = y as usize * w + x as usize;
+            mag[i] = m;
+            if m > 1e-6 {
+                // Quantise the gradient direction to one of 8 neighbours.
+                let (ux, uy) = (gx / (4.0 * m), gy / (4.0 * m));
+                let q = |u: f32| if u > 0.3827 { 1 } else if u < -0.3827 { -1 } else { 0 };
+                dir[i] = (q(ux), q(uy));
+            }
+        }
+    }
+
+    // Non-maximum suppression: keep only ridge pixels across the edge.
+    let low = high * 0.5;
+    let mg = |x: isize, y: isize| {
+        if x < 0 || y < 0 || x >= w as isize || y >= h as isize { 0.0 } else { mag[y as usize * w + x as usize] }
+    };
+    let mut ridge = vec![0u8; w * h]; // 0 none, 1 weak, 2 strong
+    for y in 0..h as isize {
+        for x in 0..w as isize {
+            let i = y as usize * w + x as usize;
+            let m = mag[i];
+            if m < low {
+                continue;
+            }
+            let (dx, dy) = (dir[i].0 as isize, dir[i].1 as isize);
+            if m >= mg(x + dx, y + dy) && m > mg(x - dx, y - dy) {
+                ridge[i] = if m >= high { 2 } else { 1 };
+            }
+        }
+    }
+
+    // Hysteresis: weak pixels survive only if connected to a strong one.
+    let pw = w + 2;
+    let mut mask = vec![false; pw * (h + 2)];
+    let mut stack: Vec<usize> = (0..w * h).filter(|&i| ridge[i] == 2).collect();
+    for &i in &stack {
+        mask[(i / w + 1) * pw + i % w + 1] = true;
+    }
+    while let Some(i) = stack.pop() {
+        let (x, y) = ((i % w) as isize, (i / w) as isize);
+        for dy in -1..=1 {
+            for dx in -1..=1 {
+                let (nx, ny) = (x + dx, y + dy);
+                if nx < 0 || ny < 0 || nx >= w as isize || ny >= h as isize {
+                    continue;
+                }
+                let j = ny as usize * w + nx as usize;
+                let pj = (ny as usize + 1) * pw + nx as usize + 1;
+                if ridge[j] == 1 && !mask[pj] {
+                    mask[pj] = true;
+                    stack.push(j);
+                }
+            }
+        }
+    }
+    EdgeMap { mask, strength: mag, width: w, height: h }
+}
+
+fn gaussian_blur(v: &mut [f32], w: usize, h: usize, sigma: f32) {
+    if sigma < 0.3 {
+        return;
+    }
+    let r = (sigma * 3.0).ceil() as isize;
+    let kernel: Vec<f32> = (-r..=r).map(|i| (-(i * i) as f32 / (2.0 * sigma * sigma)).exp()).collect();
+    let norm: f32 = kernel.iter().sum();
+    let kernel: Vec<f32> = kernel.iter().map(|k| k / norm).collect();
+    let mut tmp = vec![0.0f32; w * h];
+    for y in 0..h {
+        for x in 0..w {
+            let mut acc = 0.0;
+            for (k, kv) in kernel.iter().enumerate() {
+                let sx = (x as isize + k as isize - r).clamp(0, w as isize - 1) as usize;
+                acc += v[y * w + sx] * kv;
+            }
+            tmp[y * w + x] = acc;
+        }
+    }
+    for y in 0..h {
+        for x in 0..w {
+            let mut acc = 0.0;
+            for (k, kv) in kernel.iter().enumerate() {
+                let sy = (y as isize + k as isize - r).clamp(0, h as isize - 1) as usize;
+                acc += tmp[sy * w + x] * kv;
+            }
+            v[y * w + x] = acc;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -291,6 +486,11 @@ fn trace_centrelines(img: &WorkImage, threshold: f32) -> Vec<(Vec<Vec2>, bool)> 
             m[(y + 1) * w + x + 1] = img.value(x, y) >= threshold;
         }
     }
+    trace_skeleton(m, w, h)
+}
+
+/// Thin a padded mask (false border) to a 1px skeleton and follow it into polylines.
+fn trace_skeleton(mut m: Vec<bool>, w: usize, h: usize) -> Vec<(Vec<Vec2>, bool)> {
     thin(&mut m, w, h);
 
     // m-adjacency: a diagonal only counts if neither shared 4-neighbour is set.

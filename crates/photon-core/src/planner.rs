@@ -44,19 +44,21 @@ impl Strategy {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Priority {
+    /// Most visually important first: length x strength (edge contrast, or brightness).
+    Salient,
     /// Bigger shapes first (bounding box diagonal).
     Largest,
     /// Longer paths first.
     Longest,
-    /// Brighter paths first (only meaningful with colour normalisation off).
+    /// Strongest edges / brightest paths first, regardless of size.
     Brightest,
     /// Shapes nearer the centre first.
     Central,
 }
 
 impl Priority {
-    pub const ALL: [Priority; 4] =
-        [Priority::Largest, Priority::Longest, Priority::Brightest, Priority::Central];
+    pub const ALL: [Priority; 5] =
+        [Priority::Salient, Priority::Largest, Priority::Longest, Priority::Brightest, Priority::Central];
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -80,7 +82,7 @@ impl Default for PlannerParams {
     fn default() -> Self {
         Self {
             strategy: Strategy::Combined,
-            priority: Priority::Largest,
+            priority: Priority::Salient,
             target_hz: 40.0,
             min_hz: 25.0,
             max_simplify: 0.02,
@@ -101,6 +103,10 @@ pub struct PlanStats {
     pub refresh_hz: f32,
     pub simplify_used: f32,
     pub groups: usize,
+    /// Estimated points needed to draw every input path (for auto detail).
+    pub demand: usize,
+    /// Points available across all groups (budget x groups for Take Turns).
+    pub capacity: usize,
 }
 
 /// Output of the planner. `frames` are played in turn (more than one only in Take Turns).
@@ -127,6 +133,8 @@ impl Planner {
         let pps = scan.pps.max(1) as f32;
         let budget_for = |hz: f32| (pps / hz.max(1.0)).floor() as usize;
         let input_paths = paths.len();
+        let demand = paths.iter().map(|p| scan::lit_cost(p, scan)).sum::<usize>()
+            + paths.len() * scan.blank_cost(0.1);
 
         // Rank once; every strategy works through this order.
         let mut ranked = self.rank(paths, params);
@@ -189,6 +197,12 @@ impl Planner {
                 refresh_hz,
                 simplify_used,
                 groups: frames.len(),
+                demand,
+                capacity: if params.strategy == Strategy::TakeTurns {
+                    budget * params.max_groups.max(1)
+                } else {
+                    budget
+                },
             },
             frames,
             drawn,
@@ -203,9 +217,10 @@ impl Planner {
             .map(|p| {
                 let (lo, hi) = p.bounds();
                 let mut s = match params.priority {
+                    Priority::Salient => p.weight * p.length(),
                     Priority::Largest => lo.distance(hi),
                     Priority::Longest => p.length(),
-                    Priority::Brightest => p.color.max_channel() * (1.0 + p.length() * 0.01),
+                    Priority::Brightest => p.weight * (1.0 + p.length() * 0.01),
                     Priority::Central => 1.0 / (0.05 + p.centroid().length()),
                 };
                 let c = p.centroid();
@@ -249,8 +264,18 @@ pub fn whole_shapes(ranked: Vec<Path>, scan: &ScanParams, budget: usize) -> (Vec
         }
     }
     // The estimate can be off (ordering differs); verify and shed lowest priority until it fits.
-    while !selected.is_empty() && scan::render(&selected, scan).points.len() > budget {
-        rejected.push(selected.pop().unwrap());
+    loop {
+        let len = scan::render(&selected, scan).points.len();
+        if selected.is_empty() || len <= budget {
+            break;
+        }
+        // Drop enough of the lowest-priority paths to cover the overshoot, then re-check.
+        let mut shed = 0;
+        while shed < len - budget {
+            let Some(p) = selected.pop() else { break };
+            shed += scan::lit_cost(&p, scan) + scan.blank_dwell_points() * 2;
+            rejected.push(p);
+        }
     }
     (selected, rejected)
 }
@@ -258,7 +283,11 @@ pub fn whole_shapes(ranked: Vec<Path>, scan: &ScanParams, budget: usize) -> (Vec
 /// Find the smallest simplification (up to `max_eps`) that makes everything fit.
 /// Returns the simplified paths (maximally simplified if nothing fits) and the tolerance used.
 fn simplify_to_fit(paths: Vec<Path>, scan: &ScanParams, budget: usize, max_eps: f32) -> (Vec<Path>, f32) {
-    let fits = |ps: &[Path]| scan::render(ps, scan).points.len() <= budget;
+    // Cheap lower bound first (lit points alone), full render only if that passes.
+    let fits = |ps: &[Path]| {
+        ps.iter().map(|p| scan::lit_cost(p, scan)).sum::<usize>() <= budget
+            && scan::render(ps, scan).points.len() <= budget
+    };
     if fits(&paths) || max_eps <= 0.0 {
         return (paths, 0.0);
     }
@@ -271,7 +300,7 @@ fn simplify_to_fit(paths: Vec<Path>, scan: &ScanParams, budget: usize, max_eps: 
                 if pts.len() < if p.closed { 3 } else { 2 } {
                     p.clone()
                 } else {
-                    Path::new(pts, p.closed, p.color)
+                    Path { points: pts, ..p.clone() }
                 }
             })
             .collect()

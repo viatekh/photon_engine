@@ -28,9 +28,13 @@ Current output: **LaserCube / LaserDock over USB** (plus a simulator for working
 3. Click **ARM**. **Space** or **Esc** blacks out immediately.
 4. Use the Frame pattern to check orientation (the red arrow points up; use Flip X/Y if not), then
    tick *Edit corners* and drag the yellow handles in the output preview to keystone.
-5. Untick *Test pattern*, pick your Syphon/NDI source (or the built-in *Demo animation*).
+5. Untick *Test pattern*, pick your Syphon/NDI source (or a built-in demo: *rings* or *fractal zoom*).
 
-In Resolume: Output → Syphon/Spout server (or NDI). Laser-friendly content is thin bright lines on black.
+In Resolume: Output → Syphon/Spout server (or NDI). Any content works in **Edges** mode (the default);
+thin bright lines on black also work well in **Centreline** mode.
+
+If a new version changes defaults, **Reset all settings** (bottom of the left panel) picks them up;
+it keeps your source, device and keystone.
 
 ## How it works
 
@@ -39,16 +43,22 @@ source frame ─► downsample ─► trace (centreline | outline) ─► smooth
             ─► keystone + clip ─► anti-breakup planner ─► colour/safety ─► DAC
 ```
 
-* **Tracing.** *Centreline* thins bright areas to a 1px skeleton and follows it (best for line
+* **Tracing.** *Edges* (default) handles any content, including films and fractals: blur → gradient →
+  thin edges to single lines → link weak edges onto strong ones (Canny) → follow the edges as line art. Each path is
+  weighted by its edge contrast. *Centreline* thins bright areas to a 1px skeleton and follows it (best for line
   content). *Outline* traces region edges with marching squares (works for anything, but a line
   becomes a loop: twice the scan time).
+* **Auto detail.** A feedback loop compares how many points the traced content would need with
+  the budget, and every frame raises or lowers the edge threshold, minimum stroke length and
+  (for very busy content) blur. A sparse frame gets more detail; a fractal keeps only its
+  strongest, longest structures. *Temporal smoothing* blends frames to reduce edge flicker on video.
 * **Scan model.** Paths are resampled so the beam never moves faster than the *lit speed* (blanked
   jumps use *blank speed*), with dwell at corners, path ends and blank transitions. Settings are in
   physical units (speed, µs), so they don't change meaning when you change the point rate.
 * **Anti-breakup.** Budget = points/sec ÷ refresh rate. A shape is only ever drawn **whole**; every
   strategy ends with the whole-shapes pass, so a frame never exceeds the budget.
-  * **A. Whole shapes:** greedily keep complete shapes in priority order (largest / longest /
-    brightest / most central) until the budget at the *target* refresh is full.
+  * **A. Whole shapes:** greedily keep complete shapes in priority order (salient = length ×
+    edge strength, the default; or largest / longest / brightest / most central) until the budget at the *target* refresh is full.
   * **B. Simplify:** find the smallest Douglas-Peucker simplification (≤ *max simplify*) that fits,
     then A.
   * **C. Adaptive refresh:** allow refresh to drop to *min refresh* before dropping shapes.
@@ -91,10 +101,13 @@ cargo test --release -p photon-core --test pipeline -- --ignored --nocapture   #
 * **Not yet run on a Mac or on real hardware.** It was developed on Linux: the core is tested, the
   macOS code type-checks for Apple Silicon, and the GUI was exercised with the simulator. The
   Objective-C Syphon bridge has **not** been compiled yet.
-* **LaserCube USB protocol** follows Wicked Lasers' open-source libLaserdockCore (VID 0x1fc9,
-  PID 0x04d8; command endpoint 0x01, sample endpoint 0x03, 8-byte samples). If the device doesn't
-  report free buffer space the driver falls back to time-based pacing (logged as a warning).
-  Axis orientation isn't known: use Flip X/Y.
+* **LaserCube USB protocol** has been checked against Wicked Lasers' libLaserdockCore source (VID 0x1fc9,
+  PID 0x04d8; command endpoint 0x01, sample endpoint 0x03, 8-byte samples, X mirrored as in their
+  code). Their optional host-side "security" handshake (which checks the unit is genuine) isn't sent; the
+  cube shouldn't need it to accept output.
+* **Interlock:** the LaserCube's interlock works in hardware, but over USB its state is not
+  reported (only over WiFi), so the app can't show it. If the app is armed and streaming but the
+  laser is dark, check the key/interlock.
 * **Syphon texture orientation**: if the image is upside down, tick *Flip input vertically*.
 * Scanner defaults (lit speed 450, blank speed 1500, dwells) are guesses for a LaserCube's
   galvos and need tuning by eye.

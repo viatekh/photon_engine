@@ -29,8 +29,9 @@ pub enum SourceSelection {
     None,
     Syphon { app: String, name: String },
     Ndi { name: String },
-    /// Built-in animation for testing without a video source.
+    /// Built-in animations for testing without a video source.
     Demo,
+    DemoFractal,
 }
 
 impl SourceSelection {
@@ -41,14 +42,18 @@ impl SourceSelection {
                 if name.is_empty() { format!("Syphon: {app}") } else { format!("Syphon: {app} - {name}") }
             }
             SourceSelection::Ndi { name } => format!("NDI: {name}"),
-            SourceSelection::Demo => "Demo animation (built in)".into(),
+            SourceSelection::Demo => "Demo: rings (built in)".into(),
+            SourceSelection::DemoFractal => "Demo: fractal zoom (built in)".into(),
         }
     }
 
     pub fn open(&self) -> anyhow::Result<Option<Box<dyn VideoSource>>> {
         match self {
             SourceSelection::None => Ok(None),
-            SourceSelection::Demo => Ok(Some(Box::new(demo::DemoSource::new()))),
+            SourceSelection::Demo => Ok(Some(Box::new(demo::DemoSource::new(demo::DemoKind::Rings)))),
+            SourceSelection::DemoFractal => {
+                Ok(Some(Box::new(demo::DemoSource::new(demo::DemoKind::Fractal))))
+            }
             SourceSelection::Ndi { name } => Ok(Some(Box::new(ndi::NdiReceiver::connect(name)?))),
             #[cfg(all(target_os = "macos", has_syphon))]
             SourceSelection::Syphon { app, name } => {
@@ -64,7 +69,7 @@ impl SourceSelection {
 
 /// Everything the UI can offer to connect to right now.
 pub fn available_sources() -> (Vec<SourceSelection>, Vec<String>) {
-    let mut out = vec![SourceSelection::Demo];
+    let mut out = vec![SourceSelection::Demo, SourceSelection::DemoFractal];
     let mut notes = Vec::new();
     #[cfg(all(target_os = "macos", has_syphon))]
     out.extend(syphon::list());
