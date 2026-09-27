@@ -2,3 +2,4 @@
 /third_party/Syphon-Framework
 /third_party/Syphon.framework
 .DS_Store
+__pycache__/

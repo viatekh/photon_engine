@@ -93,6 +93,32 @@ def stability(seq):
     return (sum(churn) / len(churn) if churn else 0.0), pops, pop_frames
 
 
+def raster(paths, n=64):
+    """Set of grid cells (n x n over the laser field) the paths pass through."""
+    cells = set()
+    for p in paths:
+        pts = path_points(p)
+        if p["cl"] and len(pts) > 2:
+            pts = pts + [pts[0]]
+        for (x0, y0), (x1, y1) in zip(pts, pts[1:]):
+            steps = int(max(abs(x1 - x0), abs(y1 - y0)) * n) + 1
+            for k in range(steps + 1):
+                t = k / steps
+                x, y = x0 + (x1 - x0) * t, y0 + (y1 - y0) * t
+                cells.add((min(n - 1, int((x + 1) / 2 * n)), min(n - 1, int((y + 1) / 2 * n))))
+    return cells
+
+
+def cell_flicker(seq):
+    """Fraction of lit cells per frame that blink: lit at t-1 and t+1 but dark at t.
+    Independent of how shapes are grouped, so it measures what the eye sees."""
+    blink, lit = 0, 0
+    for t in range(1, len(seq) - 1):
+        blink += len((seq[t - 1] & seq[t + 1]) - seq[t])
+        lit += len(seq[t]) or 1
+    return blink / max(lit, 1)
+
+
 def pct(v):
     return f"{100 * v:.0f}%"
 
@@ -138,6 +164,10 @@ def summary(path):
         blanks[f.get("out_blank")] = blanks.get(f.get("out_blank"), 0) + 1
     print(f"  output state: " + ", ".join(f"{k or 'lit'}={v}" for k, v in blanks.items()))
 
+    fd = cell_flicker([raster(f["drawn"]) for f in frames])
+    ft = cell_flicker([raster(f["drawn"] + f["dropped"]) for f in frames])
+    print(f"  blink (cells dark for one frame): drawn {100 * fd:.2f}%  traced {100 * ft:.2f}%  "
+          f"(what the eye sees as flicker; lower is better)")
     drawn = [shapes(f["drawn"]) for f in frames]
     traced = [shapes(f["drawn"] + f["dropped"]) for f in frames]
     dc, dp, dpf = stability(drawn)

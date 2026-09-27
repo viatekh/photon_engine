@@ -99,6 +99,10 @@ pub struct Path {
     pub group: u32,
     /// Whether auto detail can reduce this path (edge / threshold traces, not strokes or patterns).
     pub detail_controlled: bool,
+    /// Object id from the tracker (0 = not tracked).
+    pub track: u32,
+    /// Closed path whose first point is its chosen seam: draw from there, in this direction.
+    pub fixed_start: bool,
 }
 
 /// A path that is a shape on its own.
@@ -106,7 +110,7 @@ pub const NO_GROUP: u32 = 0;
 
 impl Path {
     pub fn new(points: Vec<Vec2>, closed: bool, color: Rgb) -> Self {
-        Self { points, closed, color, weight: 1.0, group: NO_GROUP, detail_controlled: false }
+        Self { points, closed, color, weight: 1.0, group: NO_GROUP, detail_controlled: false, track: 0, fixed_start: false }
     }
 
     /// Drawn length, including the closing segment of a closed path.

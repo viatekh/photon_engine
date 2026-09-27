@@ -48,9 +48,9 @@ impl AutoDetail {
         match p.mode {
             TraceMode::Edges | TraceMode::Auto => {
                 p.edge_threshold = (base.edge_threshold * k.powf(0.6)).clamp(0.02, 1.2);
-                // Min length is per shape, so this drops small fragments / texture, never
-                // pieces of a larger shape.
-                p.min_length_px = base.min_length_px * k;
+                // Drops small edge fragments / texture (per shape, never pieces of a larger
+                // shape). Strokes keep the base min length; the planner culls those.
+                p.edge_min_length_scale = base.edge_min_length_scale * k.max(1.0);
                 // Busy content: blur edges more so bold structure wins over fine texture
                 // (strokes are detected on the unblurred image, so lines stay crisp).
                 if k > 1.0 {
@@ -112,7 +112,7 @@ mod tests {
         let base = VectoriseParams::default();
         let p = d.apply(&base, &auto);
         assert!(p.edge_threshold > base.edge_threshold);
-        assert!(p.min_length_px > base.min_length_px);
+        assert!(p.edge_min_length_scale > base.edge_min_length_scale);
     }
 
     #[test]

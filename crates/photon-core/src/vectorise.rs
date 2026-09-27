@@ -82,8 +82,11 @@ pub struct VectoriseParams {
     pub smoothing: u32,
     /// Douglas-Peucker tolerance in working-image pixels.
     pub simplify_px: f32,
-    /// Paths shorter than this (working-image pixels) are dropped as noise.
+    /// Shapes shorter than this (working-image pixels) are dropped as noise.
     pub min_length_px: f32,
+    /// Extra multiplier on the minimum length for edge-traced shapes only (set by auto detail
+    /// to thin out film / texture detail without touching strokes).
+    pub edge_min_length_scale: f32,
     /// Scale colours so the brightest channel is 1.0 (lasers look best fully driven).
     pub normalise_colour: bool,
 }
@@ -104,6 +107,7 @@ impl Default for VectoriseParams {
             smoothing: 2,
             simplify_px: 0.6,
             min_length_px: 6.0,
+            edge_min_length_scale: 1.0,
             normalise_colour: true,
         }
     }
@@ -111,6 +115,7 @@ impl Default for VectoriseParams {
 
 /// How a raw path was found (decides how it is coloured and weighted).
 #[derive(Clone, Copy, PartialEq)]
+#[repr(u8)]
 enum Kind {
     /// Centre of a bright line / region (threshold modes).
     Region,
@@ -199,6 +204,8 @@ pub fn vectorise(img: &WorkImage, params: &VectoriseParams) -> Vec<Path> {
         }
     };
 
+    let raws = stitch(raws, img);
+
     // Minimum length applies per shape (group), so a shape never loses short pieces between
     // its junctions; only shapes that are small overall are dropped as noise.
     let raw_len = |r: &Raw| Path::new(r.pts.clone(), r.closed, Rgb::BLACK).length();
@@ -210,7 +217,8 @@ pub fn vectorise(img: &WorkImage, params: &VectoriseParams) -> Vec<Path> {
     raws.into_iter()
         .filter(|r| {
             let len = if r.group == 0 { raw_len(r) } else { group_len[&r.group] };
-            len >= params.min_length_px
+            let scale = if r.kind == Kind::Edge { params.edge_min_length_scale.max(1.0) } else { 1.0 };
+            len >= params.min_length_px * scale
         })
         .filter_map(|raw| {
             let closed = raw.closed;
@@ -247,11 +255,108 @@ pub fn vectorise(img: &WorkImage, params: &VectoriseParams) -> Vec<Path> {
             let mut path = Path::new(points, closed, color);
             path.weight = weight;
             path.group = raw.group;
-            // Every traced path responds to auto detail (strokes via min shape size only).
-            path.detail_controlled = true;
+            // Auto detail steers edge / threshold content. Strokes are left to the planner,
+            // whose selection has hysteresis (a tracing cutoff would make them flicker).
+            path.detail_controlled = raw.kind != Kind::Stroke;
             Some(path)
         })
         .collect()
+}
+
+/// Join open paths of the same shape and kind that meet end to end (the skeleton tracer splits
+/// at every junction) into longer strokes, continuing as straight as possible through each
+/// junction. Fewer pieces = fewer dwell points, so more content fits and a shape's cost stays
+/// stable from frame to frame.
+/// Pieces of different colour (e.g. a white line touching a pink ring) are never joined.
+fn stitch(raws: Vec<Raw>, img: &WorkImage) -> Vec<Raw> {
+    const JOIN: f32 = 1.5; // pixels
+    let hue = |pts: &[Vec2]| {
+        let c = sample_edge_colour(img, pts);
+        let m = c.max_channel().max(1e-6);
+        Rgb::new(c.r / m, c.g / m, c.b / m)
+    };
+    let (closed, open): (Vec<Raw>, Vec<Raw>) = raws.into_iter().partition(|r| r.closed || r.pts.len() < 2);
+    let mut out = closed;
+    // Bucket by (group, kind) so only pieces of the same shape are joined.
+    let mut buckets: HashMap<(u32, u8), Vec<Raw>> = HashMap::new();
+    for r in open {
+        let key = (r.group, r.kind as u8);
+        buckets.entry(key).or_default().push(r);
+    }
+    let mut keys: Vec<(u32, u8)> = buckets.keys().copied().collect();
+    keys.sort_unstable();
+    for key in keys {
+        let mut pieces = buckets.remove(&key).unwrap();
+        if key.0 == 0 {
+            out.extend(pieces);
+            continue;
+        }
+        // Longest first, so the main strokes grow and short spurs attach to them.
+        pieces.sort_by(|a, b| b.pts.len().cmp(&a.pts.len()));
+        let colours: Vec<Rgb> = pieces.iter().map(|p| hue(&p.pts)).collect();
+        let close = |a: Rgb, b: Rgb| (a.r - b.r).abs() + (a.g - b.g).abs() + (a.b - b.b).abs() < 0.45;
+        let mut used = vec![false; pieces.len()];
+        for i in 0..pieces.len() {
+            if used[i] {
+                continue;
+            }
+            used[i] = true;
+            let mut chain = pieces[i].pts.clone();
+            // Extend at the end, then (reversed) at the start.
+            for _ in 0..2 {
+                loop {
+                    let n = chain.len();
+                    let end = chain[n - 1];
+                    let dir = direction(&chain, true);
+                    let mut best: Option<(usize, bool, f32)> = None;
+                    for (j, pc) in pieces.iter().enumerate() {
+                        if used[j] || !close(colours[i], colours[j]) {
+                            continue;
+                        }
+                        for (rev, at) in [(false, pc.pts[0]), (true, pc.pts[pc.pts.len() - 1])] {
+                            if at.distance(end) > JOIN {
+                                continue;
+                            }
+                            let mut cand = pc.pts.clone();
+                            if rev {
+                                cand.reverse();
+                            }
+                            let cdir = direction(&cand, false);
+                            let straight = dir.dot(cdir); // 1 = straight on
+                            if best.is_none_or(|b| straight > b.2) {
+                                best = Some((j, rev, straight));
+                            }
+                        }
+                    }
+                    let Some((j, rev, _)) = best else { break };
+                    used[j] = true;
+                    let mut next = pieces[j].pts.clone();
+                    if rev {
+                        next.reverse();
+                    }
+                    let skip = if next[0].distance(end) < 1e-3 { 1 } else { 0 };
+                    chain.extend_from_slice(&next[skip..]);
+                }
+                chain.reverse();
+            }
+            let closed = chain.len() > 3 && chain[0].distance(chain[chain.len() - 1]) <= JOIN;
+            if closed {
+                chain.pop();
+            }
+            out.push(Raw { pts: chain, closed, kind: pieces[i].kind, group: key.0 });
+        }
+    }
+    out
+}
+
+/// Unit direction at one end of a polyline, looking a few points in; pointing outwards at the
+/// end (`at_end`), or inwards from the start.
+fn direction(pts: &[Vec2], at_end: bool) -> Vec2 {
+    let n = pts.len();
+    let k = 4.min(n - 1);
+    let d = if at_end { pts[n - 1] - pts[n - 1 - k] } else { pts[k] - pts[0] };
+    let l = d.length();
+    if l < 1e-6 { Vec2::ZERO } else { d * (1.0 / l) }
 }
 
 fn with_groups(paths: Vec<(Vec<Vec2>, bool)>, labels: &[u32], pw: usize, kind: Kind) -> Vec<Raw> {
@@ -309,8 +414,8 @@ fn label(mask: &[bool], w: usize, h: usize) -> Vec<u32> {
 }
 
 /// Filter a padded stroke mask to components whose skeleton is line-like: at least `min_len`
-/// pixels long, with few loose ends (12+ skeleton pixels per end). Crossings are fine - line
-/// art crosses itself all the time - but texture and filigree skeletons are full of spurs.
+/// pixels long, with few loose ends. Line art crosses itself (dense ring clusters have a
+/// junction every ~7 px) but has few loose ends; texture / filigree skeletons are full of spurs.
 fn line_like(mask: Vec<bool>, w: usize, h: usize, min_len: f32) -> Vec<bool> {
     let labels = label(&mask, w, h);
     let mut skel = mask.clone();
@@ -318,6 +423,7 @@ fn line_like(mask: Vec<bool>, w: usize, h: usize, min_len: f32) -> Vec<bool> {
     let n = labels.iter().copied().max().unwrap_or(0) as usize;
     let mut len = vec![0usize; n + 1];
     let mut nodes = vec![0usize; n + 1];
+    let mut junctions = vec![0usize; n + 1];
     for y in 1..h - 1 {
         for x in 1..w - 1 {
             let i = y * w + x;
@@ -337,10 +443,25 @@ fn line_like(mask: Vec<bool>, w: usize, h: usize, min_len: f32) -> Vec<bool> {
             if k <= 1 {
                 nodes[l] += 1;
             }
+            if k >= 3 {
+                junctions[l] += 1;
+            }
+        }
+    }
+    if std::env::var("PE_DEBUG_STROKES").is_ok() {
+        for l in 1..=n {
+            if len[l] >= 20 {
+                eprintln!("stroke comp len {} ends {} junctions {}", len[l], nodes[l], junctions[l]);
+            }
         }
     }
     let keep: Vec<bool> = (0..=n)
-        .map(|l| l > 0 && len[l] as f32 >= min_len.max(4.0) && nodes[l] * 12 <= len[l])
+        .map(|l| {
+            // Measured loose ends per skeleton pixel: overlapping ring clusters <= 0.018,
+            // fractal filigree >= 0.057. Junction density does NOT separate them (dense ring
+            // clusters reach 0.15, like filigree). A plain line has 2 ends at any length.
+            l > 0 && len[l] as f32 >= min_len.max(4.0) && nodes[l] * 40 <= len[l] + 80
+        })
         .collect();
     mask.iter().zip(&labels).map(|(&m, &l)| m && keep[l as usize]).collect()
 }
@@ -507,13 +628,32 @@ fn sample_colour(img: &WorkImage, pts: &[Vec2], threshold: f32) -> Rgb {
     sum.scale(1.0 / n as f32)
 }
 
-/// Colour of the brighter side of an edge: the brightest pixel around each vertex.
+/// Colour of a stroke / the brighter side of an edge, sampled every pixel along the path.
+/// At each sample the pixel under the path is used if it is lit, else the brightest neighbour
+/// (for edges, which sit between pixels). The per-channel **median** is taken, and the ends are
+/// skipped when possible, so pixels of another shape at a junction don't tint the result.
 fn sample_edge_colour(img: &WorkImage, pts: &[Vec2]) -> Rgb {
-    let mut sum = Rgb::BLACK;
-    let mut n = 0usize;
-    for p in pts {
-        let cx = p.x.floor() as isize;
-        let cy = p.y.floor() as isize;
+    let mut samples: Vec<Vec2> = Vec::new();
+    for w in pts.windows(2) {
+        let n = (w[0].distance(w[1]).ceil() as usize).max(1);
+        for k in 0..n {
+            samples.push(w[0].lerp(w[1], k as f32 / n as f32));
+        }
+    }
+    if let Some(&last) = pts.last() {
+        samples.push(last);
+    }
+    if samples.len() > 8 {
+        let trim = 2;
+        samples = samples[trim..samples.len() - trim].to_vec();
+    }
+    let mut rs = Vec::with_capacity(samples.len());
+    let mut gs = Vec::with_capacity(samples.len());
+    let mut bs = Vec::with_capacity(samples.len());
+    for p in &samples {
+        let cx = (p.x.floor() as isize).clamp(0, img.width as isize - 1);
+        let cy = (p.y.floor() as isize).clamp(0, img.height as isize - 1);
+        let centre = img.get(cx as usize, cy as usize);
         let mut best = Rgb::BLACK;
         for y in (cy - 1).max(0)..=(cy + 1).min(img.height as isize - 1) {
             for x in (cx - 1).max(0)..=(cx + 1).min(img.width as isize - 1) {
@@ -523,10 +663,19 @@ fn sample_edge_colour(img: &WorkImage, pts: &[Vec2]) -> Rgb {
                 }
             }
         }
-        sum = Rgb::new(sum.r + best.r, sum.g + best.g, sum.b + best.b);
-        n += 1;
+        let c = if centre.max_channel() >= 0.5 * best.max_channel() { centre } else { best };
+        rs.push(c.r);
+        gs.push(c.g);
+        bs.push(c.b);
     }
-    if n == 0 { Rgb::BLACK } else { sum.scale(1.0 / n as f32) }
+    if rs.is_empty() {
+        return Rgb::BLACK;
+    }
+    let median = |v: &mut Vec<f32>| {
+        v.sort_by(|a, b| a.total_cmp(b));
+        v[v.len() / 2]
+    };
+    Rgb::new(median(&mut rs), median(&mut gs), median(&mut bs))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1135,7 +1284,7 @@ mod tests {
     }
 
     #[test]
-    fn centreline_cross_splits_at_junction() {
+    fn centreline_cross_becomes_two_straight_strokes() {
         let img = image_from(&[
             ".........",
             "....#....",
@@ -1154,7 +1303,11 @@ mod tests {
             ..Default::default()
         };
         let paths = vectorise(&img, &params);
-        assert_eq!(paths.len(), 4, "{paths:?}");
+        assert_eq!(paths.len(), 2, "{paths:?}");
+        // Stitched straight through the junction: one vertical, one horizontal stroke.
+        let vertical = paths.iter().any(|p| p.points.iter().all(|v| v.x.abs() < 1e-4));
+        let horizontal = paths.iter().any(|p| p.points.iter().all(|v| v.y.abs() < 1e-4));
+        assert!(vertical && horizontal, "{paths:?}");
     }
 
     #[test]

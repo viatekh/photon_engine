@@ -51,10 +51,13 @@ fn run(rings: usize, mode: TraceMode, strategy: Strategy) -> (usize, usize, usiz
     let paths = geometry.apply(&paths);
     let scan = ScanParams::default();
     let params = PlannerParams { strategy, ..Default::default() };
-    let plan = Planner::new().plan(paths, &scan, &params);
+    // Steady state: the same frame twice (object tracking confirms objects on the 2nd frame).
+    let mut planner = Planner::new();
+    planner.plan(paths.clone(), &scan, &params);
+    let plan = planner.plan(paths, &scan, &params);
     for f in &plan.frames {
         assert!(f.points.len() <= plan.stats.budget);
-        let out = ColourParams::default().apply(&f.points);
+        let out = ColourParams::default().apply(&f.points, 30_000);
         assert!(out.iter().all(|p| p.x.abs() <= 1.0 && p.y.abs() <= 1.0));
     }
     (plan.stats.input_paths, plan.stats.drawn_paths, plan.stats.points, plan.stats.budget)
@@ -295,4 +298,20 @@ fn auto_filled_shape_uses_its_outline() {
     let paths = auto_paths(&data);
     assert_eq!(paths.len(), 1, "{}", paths.len());
     assert!(paths[0].closed);
+}
+
+#[test]
+#[ignore = "diagnostic"]
+fn stroke_stats() {
+    let vp = VectoriseParams::default();
+    eprintln!("--- rings");
+    let data = rings_frame(&[(400.0, 270.0, 60.0), (470.0, 270.0, 60.0), (430.0, 330.0, 50.0), (520.0, 300.0, 40.0), (360.0, 220.0, 35.0)], Some(250.0));
+    let img = WorkImage::from_frame(&data, 960, 540, 960 * 4, PixelOrder::Rgba, vp.resolution, false);
+    vectorise(&img, &vp);
+    for zoom in [40.0, 400.0, 4000.0] {
+        eprintln!("--- fractal zoom {zoom}");
+        let data = mandelbrot(960, 540, zoom);
+        let img = WorkImage::from_frame(&data, 960, 540, 960 * 4, PixelOrder::Rgba, vp.resolution, false);
+        vectorise(&img, &vp);
+    }
 }

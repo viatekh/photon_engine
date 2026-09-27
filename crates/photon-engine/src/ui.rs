@@ -263,6 +263,19 @@ impl App {
             ui.add(egui::Slider::new(&mut p.max_simplify, 0.0..=0.1).text("Max simplify"));
             ui.add(egui::Slider::new(&mut p.max_groups, 1..=6).text("Max groups (D)"));
             ui.add(egui::Slider::new(&mut p.stickiness, 0.0..=2.0).text("Selection stickiness"));
+            ui.separator();
+            ui.checkbox(&mut p.tracking.enabled, "Object permanence (track shapes)")
+                .on_hover_text("Follow shapes between frames: stable seams, hold through brief dropouts, ignore one-frame noise.");
+            ui.add_enabled_ui(p.tracking.enabled, |ui| {
+                ui.checkbox(&mut p.commit, "Commit to shapes on screen")
+                    .on_hover_text("Shapes being drawn always come before new ones: a new shape appears only when there's room.");
+                ui.add(egui::Slider::new(&mut p.tracking.confirm_frames, 1..=5).text("New shape delay (frames)"))
+                    .on_hover_text("A new shape must be seen this many frames before it's drawn. 2 = one-frame noise never reaches the laser.");
+                ui.add(egui::Slider::new(&mut p.tracking.hold_frames, 0..=6).text("Hold lost shapes (frames)"))
+                    .on_hover_text("Keep drawing a shape this many frames after the tracing loses it.");
+            });
+            ui.add(egui::Slider::new(&mut p.entry_margin, 0.0..=0.3).text("Entry margin"))
+                .on_hover_text("Hysteresis: a shape not already on screen only gets in if it fits with this fraction of the budget spare. Higher = steadier, slightly less content.");
             ui.checkbox(&mut p.split_oversized, "Split very large shapes into strokes")
                 .on_hover_text("A connected shape needing over half the frame is split into its separate strokes (each still drawn whole). Off: shapes are only drawn whole, so very large ones may not be drawn at all.");
         });
@@ -288,7 +301,8 @@ impl App {
             ui.add(egui::Slider::new(&mut c.green, 0.0..=1.0).text("Green"));
             ui.add(egui::Slider::new(&mut c.blue, 0.0..=1.0).text("Blue"));
             ui.add(egui::Slider::new(&mut c.min_level, 0.0..=0.5).text("Min level"));
-            ui.add(egui::Slider::new(&mut c.colour_delay, 0..=20).text("Colour delay (pts)"));
+            ui.add(egui::Slider::new(&mut c.colour_delay_us, 0.0..=500.0).text("Colour delay (µs)"))
+                .on_hover_text("Delays colour to line up with the lagging mirrors. If lines start early / stop short (gap at the end of a closed shape), increase; if they overshoot at the start, decrease. LaserCube default ~133.");
             ui.horizontal(|ui| {
                 ui.checkbox(&mut s.geometry.flip_x, "Flip X");
                 ui.checkbox(&mut s.geometry.flip_y, "Flip Y");
@@ -312,13 +326,21 @@ impl App {
 
         egui::CollapsingHeader::new("Scanner tuning").default_open(false).show(ui, |ui| {
             let sc = &mut s.scan;
-            ui.small("Speeds and dwells are for a 30K scanner; the scanner rating above scales them.");
-            ui.add(egui::Slider::new(&mut sc.lit_speed, 50.0..=2000.0).text("Lit speed"));
-            ui.add(egui::Slider::new(&mut sc.blank_speed, 100.0..=5000.0).text("Blank speed"));
-            ui.add(egui::Slider::new(&mut sc.corner_dwell_us, 0.0..=500.0).text("Corner dwell (µs)"));
-            ui.add(egui::Slider::new(&mut sc.corner_min_angle, 0.0..=90.0).text("Corner angle (°)"));
-            ui.add(egui::Slider::new(&mut sc.path_dwell_us, 0.0..=500.0).text("Path end dwell (µs)"));
-            ui.add(egui::Slider::new(&mut sc.blank_dwell_us, 0.0..=500.0).text("Blank dwell (µs)"));
+            ui.small("Values are for a 30K scanner; the scanner rating above scales them.");
+            ui.add(egui::Slider::new(&mut sc.lit_speed, 100.0..=2000.0).text("Lit speed"))
+                .on_hover_text("Top speed while drawing (field units per second; the field is 2 wide).");
+            ui.add(egui::Slider::new(&mut sc.lit_accel, 2e5..=6e6).logarithmic(true).text("Lit acceleration"))
+                .on_hover_text("Lower = smoother lines, less wobble/overshoot, but more points per shape.");
+            ui.add(egui::Slider::new(&mut sc.corner_tolerance, 0.0005..=0.02).logarithmic(true).text("Corner rounding"))
+                .on_hover_text("How much a corner may be rounded at speed. Lower = sharper corners, slower through them.");
+            ui.add(egui::Slider::new(&mut sc.blank_speed, 200.0..=6000.0).text("Blank speed"));
+            ui.add(egui::Slider::new(&mut sc.blank_accel, 2e5..=1.5e7).logarithmic(true).text("Blank acceleration"));
+            ui.add(egui::Slider::new(&mut sc.path_dwell_us, 0.0..=300.0).text("Path end hold (µs)"));
+            ui.add(egui::Slider::new(&mut sc.blank_pre_us, 0.0..=300.0).text("Blank hold before jump (µs)"));
+            ui.add(egui::Slider::new(&mut sc.blank_post_us, 0.0..=600.0).text("Settle after jump (µs)"))
+                .on_hover_text("Blanked wait at the new position before lighting up. Increase if lines have a bright/bent tail at their start.");
+            ui.add(egui::Slider::new(&mut sc.closed_overlap_us, 0.0..=1000.0).text("Closed-shape overlap (µs)"))
+                .on_hover_text("Draw closed shapes a little past their start so they close fully despite mirror lag.");
             ui.separator();
             ui.add(egui::Slider::new(&mut s.signal_timeout_ms, 100..=3000).text("Signal-loss blackout (ms)"));
             ui.add(egui::Slider::new(&mut s.static_beam_min_extent, 0.0..=0.3).text("Static beam guard"));
@@ -376,6 +398,11 @@ impl App {
             }
             ui.separator();
             ui.label(format!("Output {:.0} passes/s", out.frames_per_sec));
+            if out.underruns > 0 {
+                ui.separator();
+                ui.colored_label(Color32::RED, format!("DAC underruns {}", out.underruns))
+                    .on_hover_text("The laser's buffer ran dry and the beam stalled. Try a lower point rate, or report this.");
+            }
         });
     }
 

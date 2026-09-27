@@ -46,6 +46,8 @@ pub struct OutputStatus {
     pub max_pps: u32,
     pub blanked_reason: Option<&'static str>,
     pub frames_per_sec: f32,
+    /// Times the device buffer was found empty while streaming (the beam stalls). Should be 0.
+    pub underruns: u64,
 }
 
 pub struct Shared {
@@ -319,9 +321,12 @@ impl Player {
             let take = (n - out.len()).min(self.frame.len() - self.idx);
             out.extend_from_slice(&self.frame[self.idx..self.idx + take]);
             self.idx += take;
-        }
-        if let Some(p) = out.last() {
-            self.pos = p.pos();
+            // Track where the beam actually is *now*: the next frame's blanked move starts
+            // here. (Updating only after the whole batch left a stale position when a frame
+            // ended mid-batch, making the beam dart away at every frame boundary.)
+            if let Some(p) = out.last() {
+                self.pos = p.pos();
+            }
         }
     }
 
@@ -364,7 +369,7 @@ impl Player {
         let mut frame = match reason {
             Some(_) => Vec::new(),
             None => {
-                let f = settings.colour.apply(points);
+                let f = settings.colour.apply(points, settings.scan.pps);
                 if is_static_beam(&f, settings.static_beam_min_extent) {
                     self.blanked = Some("static beam blocked");
                     blank_frame(&f)
@@ -407,6 +412,10 @@ fn output(shared: Arc<Shared>) {
     let mut enabled: Option<bool> = None;
     let mut buf = Vec::new();
     let mut stats_since = Instant::now();
+    // Underrun detection: the largest free space seen is the (empty) buffer size; seeing it
+    // again after we've been streaming a while means the buffer ran dry.
+    let mut max_free = 0usize;
+    let mut streaming_since: Option<Instant> = None;
 
     while !shared.shutdown.load(Ordering::Relaxed) {
         let settings = shared.settings.read().clone();
@@ -429,6 +438,8 @@ fn output(shared: Arc<Shared>) {
                     st.max_pps = d.max_pps();
                     log::info!("output: {}", st.message);
                     dac = Some(d);
+                    max_free = 0;
+                    streaming_since = None;
                     applied_pps = 0;
                     enabled = None;
                 }
@@ -454,15 +465,22 @@ fn output(shared: Arc<Shared>) {
                 enabled = Some(want);
             }
             let free = d.free_space()?;
-            // Small chunks keep latency (and the time to go dark) low.
-            let chunk = (settings.scan.pps as usize / 100).clamp(64, 1000);
-            if free < chunk.min(256) {
+            if free > max_free {
+                max_free = free;
+            } else if free == max_free && streaming_since.is_some_and(|t| t.elapsed() > Duration::from_secs(1)) {
+                shared.output_status.lock().underruns += 1;
+            }
+            // Top the device buffer up whenever a useful amount of room appears, in one batch.
+            // (The LaserCube's USB buffer is small - libLaserdockCore treats it as 768 points,
+            // ~25 ms at 30k - so letting it drain between small writes causes stalls.)
+            if free < 64 {
                 thread::sleep(Duration::from_millis(1));
                 return Ok(());
             }
             buf.clear();
-            player.fill(&shared, &settings, free.min(chunk), &mut buf);
+            player.fill(&shared, &settings, free.min(1024), &mut buf);
             d.write(&buf)?;
+            streaming_since.get_or_insert_with(Instant::now);
             Ok(())
         })();
 
@@ -490,5 +508,41 @@ fn output(shared: Arc<Shared>) {
     if let Some(d) = dac.as_mut() {
         let _ = d.write(&vec![LaserPoint::blank(player.pos); 256]);
         let _ = d.set_enabled(false);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use photon_core::patterns::TestPattern;
+
+    /// Stream a static circle in awkward chunk sizes across many frame and plan switches: the
+    /// beam must never jump further than a blanked step (no stray moves at frame boundaries).
+    #[test]
+    fn stream_is_continuous_across_frames_and_plan_updates() {
+        let settings = Settings { test_pattern: TestPattern::Circle, ..Default::default() };
+        let shared = Shared::new(settings.clone());
+        shared.armed.store(true, Ordering::Relaxed);
+        let mut planner = Planner::new();
+        let mut player = Player::new();
+        let mut out = Vec::new();
+        for round in 0..200 {
+            if round % 7 == 0 {
+                // A fresh (identical) plan, as the pipeline publishes ~30 times a second.
+                let paths = settings.geometry.apply(&settings.test_pattern.paths());
+                publish(&shared, planner.plan(paths, &settings.scan, &settings.planner));
+            }
+            let mut chunk = Vec::new();
+            player.fill(&shared, &settings, 97 + (round * 13) % 150, &mut chunk);
+            out.extend(chunk);
+        }
+        let limit = settings.scan.blank_step().max(settings.scan.lit_step()) * 1.6;
+        let lit: Vec<&LaserPoint> = out.iter().skip(500).collect();
+        for w in lit.windows(2) {
+            let d = w[0].pos().distance(w[1].pos());
+            assert!(d <= limit, "jump of {d} between {:?} and {:?}", w[0], w[1]);
+        }
+        // And the circle is actually drawn (not blanked).
+        assert!(out.iter().skip(500).filter(|p| p.is_lit()).count() > 1000);
     }
 }

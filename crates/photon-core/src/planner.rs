@@ -6,6 +6,7 @@
 use crate::geom::{Path, Vec2, NO_GROUP};
 use std::collections::HashMap;
 use crate::scan::{self, ScanFrame, ScanParams};
+use crate::tracker::{Tracker, TrackingParams};
 use crate::vectorise::simplify;
 use serde::{Deserialize, Serialize};
 
@@ -80,6 +81,14 @@ pub struct PlannerParams {
     /// A shape needing more than half a frame's budget is split into its separate strokes
     /// (each still drawn whole). Off = shapes are only ever drawn whole (big ones may never be).
     pub split_oversized: bool,
+    /// Hysteresis: a shape not drawn last frame only enters if it fits with this fraction of
+    /// the budget to spare. Stops shapes at the budget edge flickering in and out.
+    pub entry_margin: f32,
+    /// Object permanence (follow shapes between frames, commit to them, hold through dropouts).
+    pub tracking: TrackingParams,
+    /// Commitment: shapes on screen last frame always come before new ones, so a new shape
+    /// only appears when there is room and never displaces one being drawn.
+    pub commit: bool,
 }
 
 impl Default for PlannerParams {
@@ -93,6 +102,9 @@ impl Default for PlannerParams {
             max_groups: 3,
             stickiness: 0.5,
             split_oversized: true,
+            entry_margin: 0.08,
+            tracking: TrackingParams::default(),
+            commit: true,
         }
     }
 }
@@ -133,6 +145,7 @@ pub struct Planner {
     /// Paths and shapes drawn last frame, as (centre, length), for stickiness.
     previous: Vec<(Vec2, f32)>,
     previous_shapes: Vec<(Vec2, f32)>,
+    tracker: Tracker,
 }
 
 impl Planner {
@@ -143,37 +156,49 @@ impl Planner {
     pub fn plan(&mut self, paths: Vec<Path>, scan: &ScanParams, params: &PlannerParams) -> Plan {
         let pps = scan.pps.max(1) as f32;
         let budget_for = |hz: f32| (pps / hz.max(1.0)).floor() as usize;
-        let input_paths = paths.len();
-        let input_shapes = shape_count(&paths);
+        // Object permanence: stable ids, held objects; unconfirmed (brand-new) objects wait.
+        let (paths, unconfirmed): (Vec<Path>, Vec<Path>) = if params.tracking.enabled {
+            let tracked = self.tracker.update(paths, &params.tracking);
+            tracked.into_iter().partition(|p| self.tracker.info(p.track).confirmed)
+        } else {
+            (paths, Vec::new())
+        };
+        let input_paths = paths.len() + unconfirmed.len();
+        let input_shapes = shape_count(&paths) + shape_count(&unconfirmed);
         let cost = |p: &Path| scan::lit_cost(p, scan) + scan.blank_cost(0.1);
         let demand: usize = paths.iter().map(cost).sum();
         let demand_controlled: usize = paths.iter().filter(|p| p.detail_controlled).map(cost).sum();
 
+        if debug_plan() {
+            eprintln!("PLAN");
+        }
         let split = params.split_oversized;
+        let margin = params.entry_margin;
+        let incumbent = |shape: &[Path]| self.was_drawn(shape);
         // Rank once; every strategy works through this order.
         let mut ranked = self.rank(paths, params);
 
         let (groups, dropped, simplify_used, budget) = match params.strategy {
             Strategy::WholeShapes => {
                 let b = budget_for(params.target_hz);
-                let (sel, drop) = whole_shapes(ranked, scan, b, split);
+                let (sel, drop) = whole_shapes(ranked, scan, b, split, &incumbent, margin);
                 (vec![sel], drop, 0.0, b)
             }
             Strategy::Simplify => {
                 let b = budget_for(params.target_hz);
                 let (paths, eps) = simplify_to_fit(ranked, scan, b, params.max_simplify);
-                let (sel, drop) = whole_shapes(paths, scan, b, split);
+                let (sel, drop) = whole_shapes(paths, scan, b, split, &incumbent, margin);
                 (vec![sel], drop, eps, b)
             }
             Strategy::AdaptiveRefresh => {
                 let b = budget_for(params.min_hz);
-                let (sel, drop) = whole_shapes(ranked, scan, b, split);
+                let (sel, drop) = whole_shapes(ranked, scan, b, split, &incumbent, margin);
                 (vec![sel], drop, 0.0, b)
             }
             Strategy::Combined => {
                 let b = budget_for(params.min_hz);
                 let (paths, eps) = simplify_to_fit(ranked, scan, b, params.max_simplify);
-                let (sel, drop) = whole_shapes(paths, scan, b, split);
+                let (sel, drop) = whole_shapes(paths, scan, b, split, &incumbent, margin);
                 (vec![sel], drop, eps, b)
             }
             Strategy::TakeTurns => {
@@ -183,7 +208,7 @@ impl Planner {
                     if ranked.is_empty() {
                         break;
                     }
-                    let (sel, rest) = whole_shapes(ranked, scan, b, split);
+                    let (sel, rest) = whole_shapes(ranked, scan, b, split, &|_: &[Path]| false, 0.0);
                     if sel.is_empty() {
                         ranked = rest;
                         break;
@@ -197,6 +222,11 @@ impl Planner {
 
         let frames: Vec<ScanFrame> = groups.iter().map(|g| scan::render(g, scan)).collect();
         let drawn: Vec<Path> = groups.into_iter().flatten().collect();
+        let mut dropped = dropped;
+        dropped.extend(unconfirmed);
+        if params.tracking.enabled {
+            self.tracker.drawn(&drawn);
+        }
         self.previous = drawn.iter().map(|p| (p.centroid(), p.length())).collect();
         self.previous_shapes = shape_summaries(&drawn).into_iter().map(|(_, c, l)| (c, l)).collect();
 
@@ -226,6 +256,30 @@ impl Planner {
             drawn,
             dropped,
         }
+    }
+
+    /// Whether a shape was on screen last frame: as a whole shape, or mostly (by length) as
+    /// individual paths (which survives shapes merging, splitting or being split for size).
+    fn was_drawn(&self, shape: &[Path]) -> bool {
+        if shape.first().is_some_and(|p| p.track != 0) {
+            // Spatial: was the laser drawing here last frame? Robust to shapes merging,
+            // splitting or being split into strokes.
+            return self.tracker.coverage(shape) >= 0.6;
+        }
+        let similar = |(ac, al): (Vec2, f32), (bc, bl): (Vec2, f32)| {
+            ac.distance(bc) < 0.06 && (al - bl).abs() <= 0.35 * al.max(bl)
+        };
+        let len: f32 = shape.iter().map(|p| p.length()).sum();
+        let centre = shape.iter().fold(Vec2::ZERO, |a, p| a + p.centroid() * p.length()) * (1.0 / len.max(1e-6));
+        if self.previous_shapes.iter().any(|&prev| similar((centre, len), prev)) {
+            return true;
+        }
+        let seen: f32 = shape
+            .iter()
+            .filter(|p| self.previous.iter().any(|&prev| similar((p.centroid(), p.length()), prev)))
+            .map(|p| p.length())
+            .sum();
+        seen >= 0.5 * len
     }
 
     /// Sort by priority, best first, keeping each shape's paths together (a shape's score is the
@@ -286,15 +340,31 @@ impl Planner {
                 // Stickiness: how much of this shape was on screen last frame. Checked per
                 // path (survives shapes merging / splitting) and per whole shape (survives
                 // the tracer splitting a shape into different pieces).
-                let shape_seen = self.previous_shapes.iter().any(|&prev| similar((centre_of(g), len), prev));
-                let seen = if shape_seen { 1.0 } else { seen_len / len.max(1e-6) };
-                (g, s * factor * (1.0 + params.stickiness * seen))
+                let track = scored.iter().find(|(_, p, _)| p.group == g).map(|(_, p, _)| p.track).unwrap_or(0);
+                let seen = if track != 0 {
+                    // Tracked: on screen if the laser drew here last frame; long-lived objects
+                    // weigh more.
+                    let members: Vec<Path> =
+                        scored.iter().filter(|(_, p, _)| p.group == g).map(|(_, p, _)| p.clone()).collect();
+                    let on = if self.tracker.coverage(&members) >= 0.6 { 1.0 } else { 0.0 };
+                    on * (1.0 + (self.tracker.info(track).age.min(30) as f32) / 30.0)
+                } else {
+                    let shape_seen = self.previous_shapes.iter().any(|&prev| similar((centre_of(g), len), prev));
+                    if shape_seen { 1.0 } else { seen_len / len.max(1e-6) }
+                };
+                // Commitment: on-screen shapes rank above every new one.
+                let committed = if params.commit && seen > 0.0 { 1e6 } else { 1.0 };
+                (g, s * factor * (1.0 + params.stickiness * seen) * committed)
             })
             .collect();
         let scored: Vec<(f32, Path)> = scored
             .into_iter()
             .map(|(s, p, seen)| {
-                let bonus = if p.group == NO_GROUP && seen { 1.0 + params.stickiness } else { 1.0 };
+                let bonus = if p.group == NO_GROUP && seen {
+                    (1.0 + params.stickiness) * if params.commit { 1e6 } else { 1.0 }
+                } else {
+                    1.0
+                };
                 (s * bonus, p)
             })
             .collect();
@@ -327,6 +397,12 @@ fn shape_summaries(paths: &[Path]) -> Vec<(u32, Vec2, f32)> {
     acc.into_values().map(|(g, c, l)| (g, c * (1.0 / l.max(1e-6)), l)).collect()
 }
 
+/// Set PE_DEBUG_PLAN=1 to log selection decisions (used with --replay).
+fn debug_plan() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("PE_DEBUG_PLAN").is_ok())
+}
+
 /// Split a ranked list into shapes: consecutive paths sharing a group.
 fn shapes(ranked: Vec<Path>) -> Vec<Vec<Path>> {
     let mut out: Vec<Vec<Path>> = Vec::new();
@@ -350,14 +426,22 @@ pub fn shape_count(paths: &[Path]) -> usize {
 /// Greedily take whole shapes (in the given order) whose rendered frame fits `budget`.
 /// A shape is every path sharing a group: it is taken or rejected as a unit.
 /// Returns (selected, rejected) paths, both in priority order.
+///
+/// Hysteresis: a shape for which `incumbent` is true (it was on screen last frame) may use the
+/// whole budget; any other shape only gets in if it fits within `budget * (1 - entry_margin)`.
+/// So shapes at the edge of the budget don't alternate between drawn and dropped.
 pub fn whole_shapes(
     ranked: Vec<Path>,
     scan: &ScanParams,
     budget: usize,
     split_oversized: bool,
+    incumbent: &dyn Fn(&[Path]) -> bool,
+    entry_margin: f32,
 ) -> (Vec<Path>, Vec<Path>) {
+    let entry_budget = (budget as f32 * (1.0 - entry_margin.clamp(0.0, 0.5))) as usize;
     let mut selected: Vec<Vec<Path>> = Vec::new();
-    let mut rejected: Vec<Path> = Vec::new();
+    // Rejected shapes, kept whole (in priority order) for the refill pass.
+    let mut rejected_shapes: Vec<Vec<Path>> = Vec::new();
     let mut used = 0usize;
     let mut endpoints: Vec<Vec2> = Vec::new();
     let mut queue: std::collections::VecDeque<Vec<Path>> = shapes(ranked).into();
@@ -394,29 +478,56 @@ pub fn whole_shapes(
             ends.push(p.start());
             ends.push(p.end());
         }
-        if used + add <= budget {
+        let is_incumbent = incumbent(&shape);
+        let limit = if is_incumbent { budget } else { entry_budget };
+        if debug_plan() {
+            eprintln!("  shape track {} paths {} add {} used {} limit {} -> {}", shape[0].track, shape.len(), add, used, limit, used + add <= limit);
+        }
+        if used + add <= limit {
             used += add;
             endpoints = ends;
             selected.push(shape);
+        } else if split_oversized && is_incumbent && shape.len() > 1 {
+            // An on-screen shape that no longer fits: keep as much of it lit as possible by
+            // trying its strokes one by one (each stroke is still drawn whole).
+            for (i, p) in shape.into_iter().enumerate() {
+                queue.insert(i, vec![p]);
+            }
         } else {
-            rejected.extend(shape);
+            rejected_shapes.push(shape);
         }
     }
-    // The estimate can be off (ordering differs); verify and shed lowest-priority shapes.
-    loop {
-        let flat: Vec<Path> = selected.iter().flatten().cloned().collect();
-        let len = scan::render(&flat, scan).points.len();
-        if selected.is_empty() || len <= budget {
-            break;
+    // The estimate can be off (ordering differs). Verify with a real render and shed: first
+    // shapes that weren't on screen last frame (dropping them causes no visible blink), then
+    // on-screen ones, lowest priority first - one at a time, so a small overshoot doesn't
+    // throw away a big shape.
+    let fits = |shapes: &[Vec<Path>]| {
+        let flat: Vec<Path> = shapes.iter().flatten().cloned().collect();
+        scan::render(&flat, scan).points.len() <= budget
+    };
+    while !selected.is_empty() && !fits(&selected) {
+        let victim = selected.iter().rposition(|s| !incumbent(s)).unwrap_or(selected.len() - 1);
+        if debug_plan() {
+            eprintln!("  verify: over budget, shedding track {}", selected[victim][0].track);
         }
-        let mut shed = 0;
-        while shed < len - budget {
-            let Some(shape) = selected.pop() else { break };
-            shed += shape.iter().map(|p| scan::lit_cost(p, scan) + scan.blank_dwell_points() * 2).sum::<usize>();
-            rejected.extend(shape);
+        rejected_shapes.push(selected.remove(victim));
+    }
+    // Refill: the real render may have left room. Retry rejected shapes (on-screen ones first,
+    // then by priority) against the actual rendered size; a few attempts at most.
+    rejected_shapes.sort_by_key(|s| !incumbent(s));
+    let mut attempts = 0;
+    let mut i = 0;
+    while i < rejected_shapes.len() && attempts < 8 {
+        selected.push(rejected_shapes[i].clone());
+        attempts += 1;
+        if fits(&selected) {
+            rejected_shapes.remove(i);
+        } else {
+            selected.pop();
+            i += 1;
         }
     }
-    (selected.into_iter().flatten().collect(), rejected)
+    (selected.into_iter().flatten().collect(), rejected_shapes.into_iter().flatten().collect())
 }
 
 /// Find the smallest simplification (up to `max_eps`) that makes everything fit.
@@ -465,6 +576,11 @@ mod tests {
     use super::*;
     use crate::geom::Rgb;
 
+    /// Single-frame budgeting tests: no object tracking (it delays brand-new objects a frame).
+    fn untracked() -> PlannerParams {
+        PlannerParams { tracking: TrackingParams { enabled: false, ..Default::default() }, ..Default::default() }
+    }
+
     fn circle(cx: f32, cy: f32, r: f32, n: usize) -> Path {
         let pts = (0..n)
             .map(|i| {
@@ -491,7 +607,7 @@ mod tests {
     fn every_strategy_respects_budget() {
         let scan = ScanParams::default();
         for strategy in Strategy::ALL {
-            let params = PlannerParams { strategy, ..Default::default() };
+            let params = PlannerParams { strategy, ..untracked() };
             let mut planner = Planner::new();
             let plan = planner.plan(many_circles(), &scan, &params);
             assert!(!plan.frames.is_empty(), "{strategy:?}");
@@ -506,7 +622,7 @@ mod tests {
     #[test]
     fn largest_shape_is_kept_first() {
         let scan = ScanParams::default();
-        let params = PlannerParams { strategy: Strategy::WholeShapes, ..Default::default() };
+        let params = PlannerParams { strategy: Strategy::WholeShapes, ..untracked() };
         let plan = Planner::new().plan(many_circles(), &scan, &params);
         assert!(plan.drawn.iter().any(|p| p.points.len() == 64));
         assert!(!plan.dropped.is_empty());
@@ -516,7 +632,7 @@ mod tests {
     fn simple_content_is_drawn_in_full() {
         let scan = ScanParams::default();
         for strategy in Strategy::ALL {
-            let params = PlannerParams { strategy, ..Default::default() };
+            let params = PlannerParams { strategy, ..untracked() };
             let plan = Planner::new().plan(vec![circle(0.0, 0.0, 0.5, 32)], &scan, &params);
             assert_eq!(plan.stats.drawn_paths, 1);
             assert!(plan.dropped.is_empty());
@@ -530,12 +646,12 @@ mod tests {
         let a = Planner::new().plan(
             many_circles(),
             &scan,
-            &PlannerParams { strategy: Strategy::WholeShapes, ..Default::default() },
+            &PlannerParams { strategy: Strategy::WholeShapes, ..untracked() },
         );
         let d = Planner::new().plan(
             many_circles(),
             &scan,
-            &PlannerParams { strategy: Strategy::TakeTurns, ..Default::default() },
+            &PlannerParams { strategy: Strategy::TakeTurns, ..untracked() },
         );
         assert!(d.stats.drawn_paths > a.stats.drawn_paths);
         assert!(d.stats.groups > 1);
@@ -544,7 +660,7 @@ mod tests {
     #[test]
     fn grouped_paths_are_drawn_all_or_nothing() {
         let scan = ScanParams::default();
-        let params = PlannerParams { strategy: Strategy::WholeShapes, ..Default::default() };
+        let params = PlannerParams { strategy: Strategy::WholeShapes, ..untracked() };
         let mut paths = many_circles();
         // Split the big circle into quarter arcs sharing a group, plus give the small circles
         // pairwise groups.
@@ -572,7 +688,7 @@ mod tests {
         let scan = ScanParams::default();
         // All circles in one group: far too big for one frame.
         let paths: Vec<Path> = many_circles().into_iter().map(|mut p| { p.group = 7; p }).collect();
-        let on = PlannerParams { strategy: Strategy::WholeShapes, ..Default::default() };
+        let on = PlannerParams { strategy: Strategy::WholeShapes, ..untracked() };
         let plan = Planner::new().plan(paths.clone(), &scan, &on);
         assert!(plan.stats.drawn_paths > 0);
         assert!(plan.frames[0].points.len() <= plan.stats.budget);
@@ -582,9 +698,41 @@ mod tests {
     }
 
     #[test]
+    fn tracking_holds_objects_through_a_dropout_and_ignores_one_frame_noise() {
+        let scan = ScanParams::default();
+        let params = PlannerParams::default();
+        let mut planner = Planner::new();
+        let ring = |g: u32| {
+            let mut c = circle(0.0, 0.0, 0.4, 32);
+            c.group = g;
+            c
+        };
+        let blip = || {
+            let mut c = circle(0.6, 0.6, 0.05, 12);
+            c.group = 99;
+            c
+        };
+        let mut drawn = Vec::new();
+        // Frames: ring, ring, ring, (dropout), ring + one-frame blip, ring, ring.
+        let frames: Vec<Vec<Path>> = vec![
+            vec![ring(1)], vec![ring(2)], vec![ring(3)], vec![], vec![ring(4), blip()], vec![ring(5)], vec![ring(6)],
+        ];
+        for f in frames {
+            let plan = planner.plan(f, &scan, &params);
+            drawn.push(plan.drawn.len());
+            // The blip is never drawn.
+            assert!(plan.drawn.iter().all(|p| p.length() > 1.0), "noise drawn");
+        }
+        // First frame waits for confirmation; afterwards the ring is drawn every frame,
+        // including the dropout frame (held).
+        assert_eq!(drawn, vec![0, 1, 1, 1, 1, 1, 1]);
+    }
+
+    #[test]
     fn shape_bigger_than_budget_is_never_partially_drawn() {
-        let scan = ScanParams { pps: 1000, ..Default::default() };
-        let params = PlannerParams { strategy: Strategy::WholeShapes, ..Default::default() };
+        let scan = ScanParams::default();
+        // 1000 Hz leaves a 30-point budget: far too small for the circle.
+        let params = PlannerParams { strategy: Strategy::WholeShapes, target_hz: 1000.0, ..untracked() };
         let plan = Planner::new().plan(vec![circle(0.0, 0.0, 0.9, 64)], &scan, &params);
         assert_eq!(plan.stats.drawn_paths, 0);
         assert!(plan.frames.iter().all(|f| f.points.is_empty()));
