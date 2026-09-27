@@ -216,6 +216,8 @@ impl App {
             } else {
                 ui.add(egui::Slider::new(&mut v.threshold, 0.02..=0.98).text("Threshold"));
             }
+            ui.checkbox(&mut v.temporal_hysteresis, "Temporal hysteresis")
+                .on_hover_text("Lines traced last frame need only the lower threshold to stay. Steadier tracing, but keeps more lines (more culling when over budget).");
             ui.add(egui::Slider::new(&mut v.temporal_smoothing, 0.0..=0.9).text("Temporal smoothing"))
                 .on_hover_text("Blend with previous frames to reduce flicker on video. Too high smears motion.");
             ui.add(egui::Slider::new(&mut v.resolution, 64..=480).text("Resolution (px)"));

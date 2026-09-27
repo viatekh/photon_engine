@@ -261,9 +261,12 @@ impl Planner {
     /// Whether a shape was on screen last frame: as a whole shape, or mostly (by length) as
     /// individual paths (which survives shapes merging, splitting or being split for size).
     fn was_drawn(&self, shape: &[Path]) -> bool {
-        if shape.first().is_some_and(|p| p.track != 0) {
-            // Spatial: was the laser drawing here last frame? Robust to shapes merging,
-            // splitting or being split into strokes.
+        if let Some(p) = shape.first().filter(|p| p.track != 0) {
+            // Same object drawn last frame (even if it moved), or - robust to shapes merging,
+            // splitting or being split into strokes - the laser was drawing right here.
+            // Identity only speaks for the whole object; single strokes of a split object are
+            // judged by whether that exact stroke was lit.
+            let _ = p;
             return self.tracker.coverage(shape) >= 0.6;
         }
         let similar = |(ac, al): (Vec2, f32), (bc, bl): (Vec2, f32)| {
@@ -346,7 +349,11 @@ impl Planner {
                     // weigh more.
                     let members: Vec<Path> =
                         scored.iter().filter(|(_, p, _)| p.group == g).map(|(_, p, _)| p.clone()).collect();
-                    let on = if self.tracker.coverage(&members) >= 0.6 { 1.0 } else { 0.0 };
+                    let on = if self.tracker.coverage(&members) >= 0.6 {
+                        1.0
+                    } else {
+                        0.0
+                    };
                     on * (1.0 + (self.tracker.info(track).age.min(30) as f32) / 30.0)
                 } else {
                     let shape_seen = self.previous_shapes.iter().any(|&prev| similar((centre_of(g), len), prev));

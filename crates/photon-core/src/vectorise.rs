@@ -73,6 +73,8 @@ pub struct VectoriseParams {
     /// Blur before stroke detection (Auto). Normally 0; auto detail raises it on busy content
     /// so fine texture stops registering as strokes.
     pub stroke_blur_px: f32,
+    /// Lines traced last frame only need the lower threshold to stay (steadier video).
+    pub temporal_hysteresis: bool,
     /// 0..0.95: blend each frame with the previous to calm flickering edges on noisy video.
     /// Leaves ghost trails on moving content, so keep it low.
     pub temporal_smoothing: f32,
@@ -102,6 +104,7 @@ impl Default for VectoriseParams {
             stroke_width_px: 3.0,
             stroke_threshold: 0.12,
             stroke_blur_px: 0.0,
+            temporal_hysteresis: false,
             temporal_smoothing: 0.0,
             resolution: 320,
             smoothing: 2,
@@ -132,12 +135,37 @@ struct Raw {
     group: u32,
 }
 
+/// What was traced last frame, for temporal hysteresis: an edge or stroke present last frame
+/// only needs the lower (hysteresis) threshold to stay, so lines hovering around the threshold
+/// - or around an auto-detail change - persist instead of blinking frame to frame.
+#[derive(Default)]
+pub struct TraceMemory {
+    size: (usize, usize),
+    edges: Vec<bool>,
+    strokes: Vec<bool>,
+}
+
+impl TraceMemory {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
 pub fn vectorise(img: &WorkImage, params: &VectoriseParams) -> Vec<Path> {
+    vectorise_with_memory(img, params, &mut TraceMemory::new())
+}
+
+pub fn vectorise_with_memory(img: &WorkImage, params: &VectoriseParams, memory: &mut TraceMemory) -> Vec<Path> {
     if img.width < 3 || img.height < 3 {
         return Vec::new();
     }
     let (w, h) = (img.width, img.height);
     let (pw, ph) = (w + 2, h + 2);
+    if memory.size != (w, h) || !params.temporal_hysteresis {
+        *memory = TraceMemory { size: (w, h), edges: vec![false; pw * ph], strokes: vec![false; pw * ph] };
+    }
+    let prev_edges = dilate(&memory.edges, pw, ph, 1);
+    let prev_strokes = dilate(&memory.strokes, pw, ph, 1);
     let mut edges: Option<EdgeMap> = None;
     let mut ridge: Option<Vec<f32>> = None;
 
@@ -173,24 +201,32 @@ pub fn vectorise(img: &WorkImage, params: &VectoriseParams) -> Vec<Path> {
             with_groups(trace_skeleton(mask, pw, ph), &labels, pw, Kind::Region)
         }
         TraceMode::Edges => {
-            let e = detect_edges(img, params.blur_px, params.edge_threshold);
+            let e = detect_edges(img, params.blur_px, params.edge_threshold, &prev_edges);
+            memory.edges = e.mask.clone();
             let labels = label(&e.mask, pw, ph);
             let out = with_groups(trace_skeleton(e.mask.clone(), pw, ph), &labels, pw, Kind::Edge);
             edges = Some(e);
             out
         }
         TraceMode::Auto => {
-            let (stroke_mask, strength) =
-                detect_strokes(img, params.stroke_width_px, params.stroke_threshold, params.stroke_blur_px);
+            let (stroke_mask, strength) = detect_strokes(
+                img,
+                params.stroke_width_px,
+                params.stroke_threshold,
+                params.stroke_blur_px,
+                &prev_strokes,
+            );
             // Keep only stroke components that look like lines; branchy texture is left to edges.
             let stroke_mask = line_like(stroke_mask, pw, ph, params.min_length_px);
-            let mut e = detect_edges(img, params.blur_px, params.edge_threshold);
+            let mut e = detect_edges(img, params.blur_px, params.edge_threshold, &prev_edges);
             // Drop edges that merely border a stroke (they would draw the line twice).
             let reach = (params.stroke_width_px / 2.0).ceil() as isize + 1;
             let near_stroke = dilate(&stroke_mask, pw, ph, reach);
             for (m, n) in e.mask.iter_mut().zip(&near_stroke) {
                 *m &= !n;
             }
+            memory.strokes = stroke_mask.clone();
+            memory.edges = e.mask.clone();
             let mut union = stroke_mask.clone();
             for (u, m) in union.iter_mut().zip(&e.mask) {
                 *u |= m;
@@ -510,7 +546,7 @@ fn dilate(mask: &[bool], w: usize, h: usize, r: isize) -> Vec<bool> {
 /// Ridge detector for thin bright strokes. A pixel is on a stroke if, along some direction, it
 /// is brighter than the pixels `r` away on *both* sides by at least `threshold`.
 /// Returns the padded stroke mask and the (unpadded) ridge strength.
-fn detect_strokes(img: &WorkImage, max_width: f32, threshold: f32, blur: f32) -> (Vec<bool>, Vec<f32>) {
+fn detect_strokes(img: &WorkImage, max_width: f32, threshold: f32, blur: f32, prev: &[bool]) -> (Vec<bool>, Vec<f32>) {
     let (w, h) = (img.width, img.height);
     let r = ((max_width / 2.0 + blur).floor() as isize + 1).max(1);
     let mut v: Vec<f32> = img.pixels.iter().map(|c| c.max_channel()).collect();
@@ -543,7 +579,10 @@ fn detect_strokes(img: &WorkImage, max_width: f32, threshold: f32, blur: f32) ->
     // Hysteresis: weak ridge pixels count only when connected to a strong one, so a line whose
     // contrast dips along its length (anti-aliasing, blur, crossings) stays in one piece.
     let mut mask = vec![false; pw * (h + 2)];
-    let mut stack: Vec<usize> = (0..w * h).filter(|&i| strength[i] >= threshold).collect();
+    // Seeds: strong ridges, plus weak ones where a stroke was traced last frame.
+    let mut stack: Vec<usize> = (0..w * h)
+        .filter(|&i| strength[i] >= threshold || (strength[i] >= low && prev[(i / w + 1) * pw + i % w + 1]))
+        .collect();
     for &i in &stack {
         mask[(i / w + 1) * pw + i % w + 1] = true;
     }
@@ -703,7 +742,8 @@ impl EdgeMap {
     }
 }
 
-pub fn detect_edges(img: &WorkImage, blur_px: f32, high: f32) -> EdgeMap {
+/// `prev` is last frame's edge mask (padded, dilated): weak edges there count as strong.
+pub fn detect_edges(img: &WorkImage, blur_px: f32, high: f32, prev: &[bool]) -> EdgeMap {
     let (w, h) = (img.width, img.height);
     let mut v: Vec<f32> = (0..w * h).map(|i| img.pixels[i].max_channel()).collect();
     gaussian_blur(&mut v, w, h, blur_px);
@@ -756,7 +796,10 @@ pub fn detect_edges(img: &WorkImage, blur_px: f32, high: f32) -> EdgeMap {
     // Hysteresis: weak pixels survive only if connected to a strong one.
     let pw = w + 2;
     let mut mask = vec![false; pw * (h + 2)];
-    let mut stack: Vec<usize> = (0..w * h).filter(|&i| ridge[i] == 2).collect();
+    let pw0 = w + 2;
+    let mut stack: Vec<usize> = (0..w * h)
+        .filter(|&i| ridge[i] == 2 || (ridge[i] == 1 && prev.get((i / w + 1) * pw0 + i % w + 1) == Some(&true)))
+        .collect();
     for &i in &stack {
         mask[(i / w + 1) * pw + i % w + 1] = true;
     }

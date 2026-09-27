@@ -12,7 +12,7 @@ use photon_core::image::WorkImage;
 use photon_core::output::{blank_frame, is_static_beam};
 use photon_core::planner::{Plan, Planner};
 use photon_core::scan::emit_blank;
-use photon_core::vectorise::vectorise;
+use photon_core::vectorise::{vectorise_with_memory, TraceMemory};
 use photon_core::{LaserPoint, Vec2};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -103,6 +103,7 @@ pub fn start(shared: Arc<Shared>) -> Vec<thread::JoinHandle<()>> {
 fn pipeline(shared: Arc<Shared>) {
     let mut planner = Planner::new();
     let mut detail = AutoDetail::default();
+    let mut trace_memory = TraceMemory::new();
     let mut previous: Option<WorkImage> = None;
     let mut source: Option<Box<dyn VideoSource>> = None;
     let mut source_sel = SourceSelection::None;
@@ -120,6 +121,7 @@ fn pipeline(shared: Arc<Shared>) {
             source = None;
             previous = None;
             detail = AutoDetail::default();
+            trace_memory = TraceMemory::new();
             source_sel = settings.source.clone();
             retry_at = Instant::now();
         }
@@ -178,7 +180,7 @@ fn pipeline(shared: Arc<Shared>) {
             }
             let level_used = detail.level;
             let vp = detail.apply(&settings.vectorise, &settings.auto_detail);
-            let paths = vectorise(&image, &vp);
+            let paths = vectorise_with_memory(&image, &vp, &mut trace_memory);
             let paths = settings.geometry.apply(&paths);
             let plan = planner.plan(paths, &settings.scan, &settings.planner);
             detail.update(&plan.stats, &settings.auto_detail);

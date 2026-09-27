@@ -56,9 +56,14 @@ struct Track {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct TrackInfo {
     pub age: u32,
+    /// Drawn last frame: this object by identity (it may have moved), or its spot spatially.
     pub drawn_last: bool,
+    /// Drawn last frame as the same object (identity match), regardless of position.
+    pub drawn_by_identity: bool,
     pub confirmed: bool,
     pub held: bool,
+    /// Number of paths making up this object this frame.
+    pub paths: usize,
 }
 
 #[derive(Default)]
@@ -205,14 +210,17 @@ impl Tracker {
                 // One shape per object, with a group id that can't collide with the tracer's.
                 p.group = TRACK_GROUP_BASE + id;
             }
+            let by_identity = drawn_last;
             let drawn_last = drawn_last || on_screen;
             self.info.insert(
                 id,
                 TrackInfo {
                     age,
                     drawn_last,
+                    drawn_by_identity: by_identity,
                     confirmed: age >= params.confirm_frames.max(1) || on_screen,
                     held: false,
+                    paths: paths.len(),
                 },
             );
             out.extend(paths.iter().cloned());
@@ -259,7 +267,17 @@ impl Tracker {
                     q
                 })
                 .collect();
-            self.info.insert(t.id, TrackInfo { age: t.age, drawn_last: true, confirmed: true, held: true });
+            self.info.insert(
+                t.id,
+                TrackInfo {
+                    age: t.age,
+                    drawn_last: true,
+                    drawn_by_identity: true,
+                    confirmed: true,
+                    held: true,
+                    paths: held.len(),
+                },
+            );
             out.extend(held.iter().cloned());
             next_tracks.push(Track {
                 centre: t.centre + shift,

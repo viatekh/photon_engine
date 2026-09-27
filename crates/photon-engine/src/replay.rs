@@ -14,7 +14,7 @@ use flate2::read::GzDecoder;
 use photon_core::detail::AutoDetail;
 use photon_core::image::WorkImage;
 use photon_core::planner::Planner;
-use photon_core::vectorise::vectorise;
+use photon_core::vectorise::{vectorise_with_memory, TraceMemory};
 use photon_core::Rgb;
 use serde_json::Value;
 use std::io::{BufRead, BufReader};
@@ -28,6 +28,7 @@ pub fn run(input: &str, output: &str) -> anyhow::Result<()> {
     let mut settings = Settings::default();
     let mut planner = Planner::new();
     let mut detail = AutoDetail::default();
+    let mut memory = TraceMemory::new();
     let out_status = OutputStatus::default();
     let mut n = 0;
     for line in reader.lines() {
@@ -38,7 +39,13 @@ pub fn run(input: &str, output: &str) -> anyhow::Result<()> {
         let v: Value = serde_json::from_str(&line)?;
         match v["type"].as_str() {
             Some("settings") => {
-                settings = serde_json::from_value(v["settings"].clone()).context("settings")?;
+                let mut raw = v["settings"].clone();
+                // PE_REPLAY_SET='{"auto_detail":{"enabled":false}}' overrides recorded settings.
+                if let Ok(patch) = std::env::var("PE_REPLAY_SET") {
+                    let patch: Value = serde_json::from_str(&patch).context("PE_REPLAY_SET")?;
+                    merge(&mut raw, &patch);
+                }
+                settings = serde_json::from_value(raw).context("settings")?;
             }
             Some("frame") => {
                 let Some(img) = v.get("image") else { continue };
@@ -51,7 +58,7 @@ pub fn run(input: &str, output: &str) -> anyhow::Result<()> {
                 let t0 = Instant::now();
                 let level = detail.level;
                 let vp = detail.apply(&settings.vectorise, &settings.auto_detail);
-                let paths = settings.geometry.apply(&vectorise(&image, &vp));
+                let paths = settings.geometry.apply(&vectorise_with_memory(&image, &vp, &mut memory));
                 let plan = planner.plan(paths, &settings.scan, &settings.planner);
                 detail.update(&plan.stats, &settings.auto_detail);
                 let ms = t0.elapsed().as_secs_f32() * 1000.0;
@@ -66,4 +73,15 @@ pub fn run(input: &str, output: &str) -> anyhow::Result<()> {
     let path = rec.finish()?;
     eprintln!("replayed {n} frames -> {}", path.display());
     Ok(())
+}
+
+fn merge(base: &mut Value, patch: &Value) {
+    match (base, patch) {
+        (Value::Object(b), Value::Object(p)) => {
+            for (k, v) in p {
+                merge(b.entry(k.clone()).or_insert(Value::Null), v);
+            }
+        }
+        (b, p) => *b = p.clone(),
+    }
 }
