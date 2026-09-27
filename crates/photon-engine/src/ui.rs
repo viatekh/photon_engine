@@ -33,7 +33,8 @@ impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let settings: Settings = cc
             .storage
-            .and_then(|s| eframe::get_value(s, SETTINGS_KEY))
+            .and_then(|s| eframe::get_value::<Settings>(s, SETTINGS_KEY))
+            .map(Settings::migrate)
             .unwrap_or_default();
         let shared = Shared::new(settings);
         let threads = crate::engine::start(shared.clone());
@@ -168,7 +169,8 @@ impl App {
                     }
                 });
             ui.small(match v.mode {
-                TraceMode::Edges => "Line art from contrast edges. Use for films, photos, fractals - anything.",
+                TraceMode::Auto => "Thin lines traced once down the middle; everything else (filled shapes, film, fractals) by its edges.",
+                TraceMode::Edges => "Contrast edges only. Thin lines give two edges.",
                 TraceMode::Centreline => "Follows the middle of bright lines. Best for laser-style line content.",
                 TraceMode::Outline => "Traces the edges of bright areas above the threshold.",
             });
@@ -176,7 +178,12 @@ impl App {
                 ui.selectable_value(&mut v.fit, FitMode::Fit, "Fit (keep aspect)");
                 ui.selectable_value(&mut v.fit, FitMode::Stretch, "Stretch");
             });
-            if v.mode == TraceMode::Edges {
+            if v.mode == TraceMode::Auto {
+                ui.add(egui::Slider::new(&mut v.stroke_width_px, 1.0..=8.0).text("Max stroke width (px)"))
+                    .on_hover_text("Lines up to this wide (in working pixels) are traced once along their centre. Wider areas are traced by their edges.");
+                ui.add(egui::Slider::new(&mut v.stroke_threshold, 0.02..=0.8).text("Stroke threshold"));
+            }
+            if v.mode.uses_edges() {
                 ui.add(egui::Slider::new(&mut v.edge_threshold, 0.02..=0.8).text("Edge threshold"));
                 ui.add(egui::Slider::new(&mut v.blur_px, 0.0..=4.0).text("Blur (px)"))
                     .on_hover_text("Higher ignores fine texture and keeps bold structure.");
@@ -230,6 +237,8 @@ impl App {
             ui.add(egui::Slider::new(&mut p.max_simplify, 0.0..=0.1).text("Max simplify"));
             ui.add(egui::Slider::new(&mut p.max_groups, 1..=6).text("Max groups (D)"));
             ui.add(egui::Slider::new(&mut p.stickiness, 0.0..=2.0).text("Selection stickiness"));
+            ui.checkbox(&mut p.split_oversized, "Split shapes too big for one frame")
+                .on_hover_text("A connected shape that can never fit is split into its separate strokes (each still drawn whole). Off: it is not drawn at all.");
         });
 
         egui::CollapsingHeader::new("Output").default_open(true).show(ui, |ui| {
@@ -321,7 +330,8 @@ impl App {
             if let Some(p) = plan {
                 let st = &p.plan.stats;
                 ui.separator();
-                ui.label(format!("Shapes {} / {} drawn", st.drawn_paths, st.input_paths));
+                ui.label(format!("Shapes {} / {} drawn", st.drawn_shapes, st.input_shapes))
+                    .on_hover_text(format!("{} / {} paths. A shape is everything that touches; it is drawn whole or not at all.", st.drawn_paths, st.input_paths));
                 ui.separator();
                 let over = st.points > st.budget;
                 ui.colored_label(
@@ -367,7 +377,7 @@ impl App {
             if p.seq != self.preview_seq {
                 self.preview_seq = p.seq;
                 let img = &p.image;
-                let thr = if s.vectorise.mode == TraceMode::Edges { 0.0 } else { s.vectorise.threshold };
+                let thr = if s.vectorise.mode.uses_edges() { 0.0 } else { s.vectorise.threshold };
                 let pixels = img
                     .pixels
                     .iter()

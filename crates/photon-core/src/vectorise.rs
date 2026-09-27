@@ -1,13 +1,18 @@
 //! Turning a raster frame into laser paths.
 //!
-//! Three tracing modes:
-//! * **Edges** finds contrast edges (Canny-style: blur, gradient, non-max suppression,
-//!   hysteresis) and follows them. Works on any content - film, photos, fractals - producing
-//!   line art. Each path gets a weight from its edge strength so weak detail is culled first.
-//! * **Outline** traces the boundary of every bright region (marching squares, sub-pixel).
-//!   Robust for any content, but a thin line becomes a thin loop, which costs twice the scan time.
-//! * **Centreline** thins bright regions to a 1px skeleton (Zhang-Suen) and follows it.
-//!   Ideal for laser-style content (thin lines on black); filled shapes collapse to their "spine".
+//! Tracing modes:
+//! * **Auto** (default) handles any content. Thin bright strokes (up to `stroke_width_px`) are
+//!   found with a ridge detector and traced once along their middle; everything else (filled
+//!   shapes, film, photos, fractals) is traced along its contrast edges, skipping edges that just
+//!   border a stroke so lines are never drawn twice.
+//! * **Edges** traces contrast edges only (Canny-style: blur, gradient, non-max suppression,
+//!   hysteresis). A thin line gives two edges.
+//! * **Outline** traces the boundary of every region brighter than a threshold.
+//! * **Centreline** thins regions brighter than a threshold to a 1px skeleton and follows it.
+//!
+//! Every path gets a **group**: paths traced from the same connected piece of the image share
+//! one, so the planner can treat e.g. a ring split at a crossing as one shape and never draw
+//! only part of it.
 
 use crate::geom::{Path, Rgb, Vec2};
 use crate::image::WorkImage;
@@ -16,20 +21,28 @@ use std::collections::HashMap;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TraceMode {
+    Auto,
     Edges,
     Outline,
     Centreline,
 }
 
 impl TraceMode {
-    pub const ALL: [TraceMode; 3] = [TraceMode::Edges, TraceMode::Centreline, TraceMode::Outline];
+    pub const ALL: [TraceMode; 4] =
+        [TraceMode::Auto, TraceMode::Edges, TraceMode::Centreline, TraceMode::Outline];
 
     pub fn label(self) -> &'static str {
         match self {
-            TraceMode::Edges => "Edges (any content)",
-            TraceMode::Centreline => "Centreline (line content)",
-            TraceMode::Outline => "Outline (bright shapes)",
+            TraceMode::Auto => "Auto (strokes + edges)",
+            TraceMode::Edges => "Edges only",
+            TraceMode::Centreline => "Centreline (threshold)",
+            TraceMode::Outline => "Outline (threshold)",
         }
+    }
+
+    /// Whether the mode uses edge detection (edge threshold / blur apply).
+    pub fn uses_edges(self) -> bool {
+        matches!(self, TraceMode::Auto | TraceMode::Edges)
     }
 }
 
@@ -49,11 +62,19 @@ pub struct VectoriseParams {
     pub fit: FitMode,
     /// Brightness (0..1) above which a pixel counts as "on" (Centreline / Outline).
     pub threshold: f32,
-    /// Edge strength (brightness change across the edge, 0..1) needed to start an edge (Edges).
+    /// Edge strength (brightness change across the edge, 0..1) needed to start an edge.
     pub edge_threshold: f32,
     /// Gaussian blur before edge detection, in working-image pixels. Suppresses fine texture.
     pub blur_px: f32,
-    /// 0..0.95: blend each frame with the previous to calm flickering edges on video.
+    /// Widest line (working-image pixels) treated as a stroke and traced once (Auto).
+    pub stroke_width_px: f32,
+    /// How much brighter than both sides a stroke must be (0..1) (Auto).
+    pub stroke_threshold: f32,
+    /// Blur before stroke detection (Auto). Normally 0; auto detail raises it on busy content
+    /// so fine texture stops registering as strokes.
+    pub stroke_blur_px: f32,
+    /// 0..0.95: blend each frame with the previous to calm flickering edges on noisy video.
+    /// Leaves ghost trails on moving content, so keep it low.
     pub temporal_smoothing: f32,
     /// Longest side of the working image in pixels. Higher = more detail, slower, noisier.
     pub resolution: usize,
@@ -70,13 +91,16 @@ pub struct VectoriseParams {
 impl Default for VectoriseParams {
     fn default() -> Self {
         Self {
-            mode: TraceMode::Edges,
+            mode: TraceMode::Auto,
             fit: FitMode::Fit,
             threshold: 0.3,
             edge_threshold: 0.12,
             blur_px: 1.0,
-            temporal_smoothing: 0.3,
-            resolution: 240,
+            stroke_width_px: 3.0,
+            stroke_threshold: 0.12,
+            stroke_blur_px: 0.0,
+            temporal_smoothing: 0.0,
+            resolution: 320,
             smoothing: 2,
             simplify_px: 0.6,
             min_length_px: 6.0,
@@ -85,39 +109,129 @@ impl Default for VectoriseParams {
     }
 }
 
+/// How a raw path was found (decides how it is coloured and weighted).
+#[derive(Clone, Copy, PartialEq)]
+enum Kind {
+    /// Centre of a bright line / region (threshold modes).
+    Region,
+    /// Centre of a thin stroke found by the ridge detector.
+    Stroke,
+    /// A contrast edge.
+    Edge,
+}
+
+struct Raw {
+    pts: Vec<Vec2>,
+    closed: bool,
+    kind: Kind,
+    group: u32,
+}
+
 pub fn vectorise(img: &WorkImage, params: &VectoriseParams) -> Vec<Path> {
-    if img.width < 2 || img.height < 2 {
+    if img.width < 3 || img.height < 3 {
         return Vec::new();
     }
-    let mut edges = None;
-    let raw = match params.mode {
-        TraceMode::Outline => trace_outlines(img, params.threshold),
-        TraceMode::Centreline => trace_centrelines(img, params.threshold),
+    let (w, h) = (img.width, img.height);
+    let (pw, ph) = (w + 2, h + 2);
+    let mut edges: Option<EdgeMap> = None;
+    let mut ridge: Option<Vec<f32>> = None;
+
+    let raws: Vec<Raw> = match params.mode {
+        TraceMode::Outline => {
+            let mask = threshold_mask(img, params.threshold);
+            let labels = label(&mask, pw, ph);
+            trace_outlines(img, params.threshold)
+                .into_iter()
+                .map(|(pts, closed)| {
+                    // Contour points sit between pixels: take the label of an adjacent lit pixel.
+                    let group = pts
+                        .first()
+                        .and_then(|p| {
+                            let (x, y) = (p.x.floor() as isize, p.y.floor() as isize);
+                            [(0, 0), (1, 0), (0, 1), (1, 1)].iter().find_map(|(dx, dy)| {
+                                let (px, py) = (x + dx + 1, y + dy + 1);
+                                if px < 0 || py < 0 || px as usize >= pw || py as usize >= ph {
+                                    return None;
+                                }
+                                let l = labels[py as usize * pw + px as usize];
+                                (l != 0).then_some(l)
+                            })
+                        })
+                        .unwrap_or(0);
+                    Raw { pts, closed, kind: Kind::Region, group }
+                })
+                .collect()
+        }
+        TraceMode::Centreline => {
+            let mask = threshold_mask(img, params.threshold);
+            let labels = label(&mask, pw, ph);
+            with_groups(trace_skeleton(mask, pw, ph), &labels, pw, Kind::Region)
+        }
         TraceMode::Edges => {
             let e = detect_edges(img, params.blur_px, params.edge_threshold);
-            let paths = trace_skeleton(e.mask.clone(), img.width + 2, img.height + 2);
+            let labels = label(&e.mask, pw, ph);
+            let out = with_groups(trace_skeleton(e.mask.clone(), pw, ph), &labels, pw, Kind::Edge);
             edges = Some(e);
-            paths
+            out
+        }
+        TraceMode::Auto => {
+            let (stroke_mask, strength) =
+                detect_strokes(img, params.stroke_width_px, params.stroke_threshold, params.stroke_blur_px);
+            // Keep only stroke components that look like lines; branchy texture is left to edges.
+            let stroke_mask = line_like(stroke_mask, pw, ph, params.min_length_px);
+            let mut e = detect_edges(img, params.blur_px, params.edge_threshold);
+            // Drop edges that merely border a stroke (they would draw the line twice).
+            let reach = (params.stroke_width_px / 2.0).ceil() as isize + 1;
+            let near_stroke = dilate(&stroke_mask, pw, ph, reach);
+            for (m, n) in e.mask.iter_mut().zip(&near_stroke) {
+                *m &= !n;
+            }
+            let mut union = stroke_mask.clone();
+            for (u, m) in union.iter_mut().zip(&e.mask) {
+                *u |= m;
+            }
+            let labels = label(&union, pw, ph);
+            let mut out = with_groups(trace_skeleton(stroke_mask, pw, ph), &labels, pw, Kind::Stroke);
+            out.extend(with_groups(trace_skeleton(e.mask.clone(), pw, ph), &labels, pw, Kind::Edge));
+            edges = Some(e);
+            ridge = Some(strength);
+            out
         }
     };
-    let mapper = PixelMapper::new(img.width, img.height, params.fit);
-    raw.into_iter()
-        .filter_map(|(pts, closed)| {
-            let pts = smooth(&pts, closed, params.smoothing);
+
+    // Minimum length applies per shape (group), so a shape never loses short pieces between
+    // its junctions; only shapes that are small overall are dropped as noise.
+    let raw_len = |r: &Raw| Path::new(r.pts.clone(), r.closed, Rgb::BLACK).length();
+    let mut group_len: HashMap<u32, f32> = HashMap::new();
+    for r in &raws {
+        *group_len.entry(r.group).or_default() += raw_len(r);
+    }
+    let mapper = PixelMapper::new(w, h, params.fit);
+    raws.into_iter()
+        .filter(|r| {
+            let len = if r.group == 0 { raw_len(r) } else { group_len[&r.group] };
+            len >= params.min_length_px
+        })
+        .filter_map(|raw| {
+            let closed = raw.closed;
+            let pts = smooth(&raw.pts, closed, params.smoothing);
             let pts = simplify(&pts, closed, params.simplify_px);
-            let min_pts = if closed { 3 } else { 2 };
-            if pts.len() < min_pts {
+            if pts.len() < if closed { 3 } else { 2 } {
                 return None;
             }
             let pixel_path = Path::new(pts, closed, Rgb::BLACK);
-            if pixel_path.length() < params.min_length_px {
-                return None;
-            }
-            let (mut color, weight) = match &edges {
-                Some(e) => (sample_edge_colour(img, &pixel_path.points), e.mean_strength(&pixel_path.points)),
-                None => {
+            let (mut color, weight) = match raw.kind {
+                Kind::Region => {
                     let c = sample_colour(img, &pixel_path.points, params.threshold);
                     (c, c.max_channel())
+                }
+                Kind::Stroke => {
+                    let r = ridge.as_ref().expect("ridge map");
+                    (sample_edge_colour(img, &pixel_path.points), mean_at(r, w, h, &pixel_path.points))
+                }
+                Kind::Edge => {
+                    let e = edges.as_ref().expect("edge map");
+                    (sample_edge_colour(img, &pixel_path.points), e.mean_strength(&pixel_path.points))
                 }
             };
             if params.normalise_colour {
@@ -132,9 +246,214 @@ pub fn vectorise(img: &WorkImage, params: &VectoriseParams) -> Vec<Path> {
             let points = pixel_path.points.iter().map(|&p| mapper.map(p)).collect();
             let mut path = Path::new(points, closed, color);
             path.weight = weight;
+            path.group = raw.group;
+            // Every traced path responds to auto detail (strokes via min shape size only).
+            path.detail_controlled = true;
             Some(path)
         })
         .collect()
+}
+
+fn with_groups(paths: Vec<(Vec<Vec2>, bool)>, labels: &[u32], pw: usize, kind: Kind) -> Vec<Raw> {
+    paths
+        .into_iter()
+        .map(|(pts, closed)| {
+            // Skeleton points are pixel centres (x + 0.5) in unpadded coordinates.
+            let group = pts
+                .first()
+                .map(|p| labels[(p.y.floor() as usize + 1) * pw + p.x.floor() as usize + 1])
+                .unwrap_or(0);
+            Raw { pts, closed, kind, group }
+        })
+        .collect()
+}
+
+/// Padded mask of pixels at or above `threshold`.
+fn threshold_mask(img: &WorkImage, threshold: f32) -> Vec<bool> {
+    let pw = img.width + 2;
+    let mut m = vec![false; pw * (img.height + 2)];
+    for y in 0..img.height {
+        for x in 0..img.width {
+            m[(y + 1) * pw + x + 1] = img.value(x, y) >= threshold;
+        }
+    }
+    m
+}
+
+/// 8-connected component labels (0 = background, 1.. = component) of a padded mask.
+fn label(mask: &[bool], w: usize, h: usize) -> Vec<u32> {
+    let mut labels = vec![0u32; w * h];
+    let mut next = 1u32;
+    let mut stack = Vec::new();
+    for start in 0..w * h {
+        if !mask[start] || labels[start] != 0 {
+            continue;
+        }
+        labels[start] = next;
+        stack.push(start);
+        while let Some(i) = stack.pop() {
+            let (x, y) = (i % w, i / w);
+            for ny in y.saturating_sub(1)..=(y + 1).min(h - 1) {
+                for nx in x.saturating_sub(1)..=(x + 1).min(w - 1) {
+                    let j = ny * w + nx;
+                    if mask[j] && labels[j] == 0 {
+                        labels[j] = next;
+                        stack.push(j);
+                    }
+                }
+            }
+        }
+        next += 1;
+    }
+    labels
+}
+
+/// Filter a padded stroke mask to components whose skeleton is line-like: at least `min_len`
+/// pixels long, with few ends/junctions (average unbranched run of 8+ pixels).
+fn line_like(mask: Vec<bool>, w: usize, h: usize, min_len: f32) -> Vec<bool> {
+    let labels = label(&mask, w, h);
+    let mut skel = mask.clone();
+    thin(&mut skel, w, h);
+    let n = labels.iter().copied().max().unwrap_or(0) as usize;
+    let mut len = vec![0usize; n + 1];
+    let mut nodes = vec![0usize; n + 1];
+    for y in 1..h - 1 {
+        for x in 1..w - 1 {
+            let i = y * w + x;
+            if !skel[i] {
+                continue;
+            }
+            let l = labels[i] as usize;
+            len[l] += 1;
+            // m-adjacency (as in trace_skeleton): diagonals only count without a shared
+            // 4-neighbour, so staircase corners aren't mistaken for junctions.
+            let at = |dx: isize, dy: isize| skel[(y as isize + dy) as usize * w + (x as isize + dx) as usize];
+            let mut k = [(1, 0), (-1, 0), (0, 1), (0, -1)].iter().filter(|&&(dx, dy)| at(dx, dy)).count();
+            k += [(1, 1), (1, -1), (-1, 1), (-1, -1)]
+                .iter()
+                .filter(|&&(dx, dy)| at(dx, dy) && !at(dx, 0) && !at(0, dy))
+                .count();
+            if k != 2 {
+                nodes[l] += 1;
+            }
+        }
+    }
+    let keep: Vec<bool> = (0..=n)
+        .map(|l| l > 0 && len[l] as f32 >= min_len.max(4.0) && nodes[l] * 8 <= len[l])
+        .collect();
+    mask.iter().zip(&labels).map(|(&m, &l)| m && keep[l as usize]).collect()
+}
+
+/// Square dilation of a padded mask by `r` pixels.
+fn dilate(mask: &[bool], w: usize, h: usize, r: isize) -> Vec<bool> {
+    // Separable: rows then columns.
+    let mut tmp = vec![false; w * h];
+    for y in 0..h {
+        let mut last: isize = -(r + 1) - 1;
+        let mut row = vec![false; w];
+        for x in 0..w {
+            if mask[y * w + x] {
+                last = x as isize;
+            }
+            row[x] = x as isize - last <= r;
+        }
+        last = isize::MAX / 2;
+        for x in (0..w).rev() {
+            if mask[y * w + x] {
+                last = x as isize;
+            }
+            tmp[y * w + x] = row[x] || last - x as isize <= r;
+        }
+    }
+    let mut out = vec![false; w * h];
+    for x in 0..w {
+        let mut last: isize = -(r + 1) - 1;
+        for y in 0..h {
+            if tmp[y * w + x] {
+                last = y as isize;
+            }
+            out[y * w + x] = y as isize - last <= r;
+        }
+        last = isize::MAX / 2;
+        for y in (0..h).rev() {
+            if tmp[y * w + x] {
+                last = y as isize;
+            }
+            out[y * w + x] |= last - y as isize <= r;
+        }
+    }
+    out
+}
+
+/// Ridge detector for thin bright strokes. A pixel is on a stroke if, along some direction, it
+/// is brighter than the pixels `r` away on *both* sides by at least `threshold`.
+/// Returns the padded stroke mask and the (unpadded) ridge strength.
+fn detect_strokes(img: &WorkImage, max_width: f32, threshold: f32, blur: f32) -> (Vec<bool>, Vec<f32>) {
+    let (w, h) = (img.width, img.height);
+    let r = ((max_width / 2.0 + blur).floor() as isize + 1).max(1);
+    let mut v: Vec<f32> = img.pixels.iter().map(|c| c.max_channel()).collect();
+    gaussian_blur(&mut v, w, h, blur);
+    let at = |x: isize, y: isize| {
+        if x < 0 || y < 0 || x >= w as isize || y >= h as isize {
+            0.0
+        } else {
+            v[y as usize * w + x as usize]
+        }
+    };
+    let pw = w + 2;
+    let mut strength = vec![0.0f32; w * h];
+    let low = threshold * 0.4;
+    for y in 0..h as isize {
+        for x in 0..w as isize {
+            let c = at(x, y);
+            if c < low {
+                continue;
+            }
+            let mut best = 0.0f32;
+            for (dx, dy) in [(1, 0), (0, 1), (1, 1), (1, -1)] {
+                let a = c - at(x + dx * r, y + dy * r);
+                let b = c - at(x - dx * r, y - dy * r);
+                best = best.max(a.min(b));
+            }
+            strength[y as usize * w + x as usize] = best;
+        }
+    }
+    // Hysteresis: weak ridge pixels count only when connected to a strong one, so a line whose
+    // contrast dips along its length (anti-aliasing, blur, crossings) stays in one piece.
+    let mut mask = vec![false; pw * (h + 2)];
+    let mut stack: Vec<usize> = (0..w * h).filter(|&i| strength[i] >= threshold).collect();
+    for &i in &stack {
+        mask[(i / w + 1) * pw + i % w + 1] = true;
+    }
+    while let Some(i) = stack.pop() {
+        let (x, y) = (i % w, i / w);
+        for ny in y.saturating_sub(1)..=(y + 1).min(h - 1) {
+            for nx in x.saturating_sub(1)..=(x + 1).min(w - 1) {
+                let j = ny * w + nx;
+                let pj = (ny + 1) * pw + nx + 1;
+                if strength[j] >= low && !mask[pj] {
+                    mask[pj] = true;
+                    stack.push(j);
+                }
+            }
+        }
+    }
+    (mask, strength)
+}
+
+fn mean_at(map: &[f32], w: usize, h: usize, pts: &[Vec2]) -> f32 {
+    if pts.is_empty() {
+        return 0.0;
+    }
+    let sum: f32 = pts
+        .iter()
+        .map(|p| {
+            let x = (p.x.floor().max(0.0) as usize).min(w - 1);
+            let y = (p.y.floor().max(0.0) as usize).min(h - 1);
+            map[y * w + x]
+        })
+        .sum();
+    sum / pts.len() as f32
 }
 
 /// Maps working-image pixel coordinates (y down) to laser space (y up).
@@ -476,18 +795,6 @@ fn trace_outlines(img: &WorkImage, iso: f32) -> Vec<(Vec<Vec2>, bool)> {
 
 // ---------------------------------------------------------------------------------------------
 // Centreline tracing: Zhang-Suen thinning, then follow the skeleton.
-
-fn trace_centrelines(img: &WorkImage, threshold: f32) -> Vec<(Vec<Vec2>, bool)> {
-    let w = img.width + 2;
-    let h = img.height + 2;
-    let mut m = vec![false; w * h];
-    for y in 0..img.height {
-        for x in 0..img.width {
-            m[(y + 1) * w + x + 1] = img.value(x, y) >= threshold;
-        }
-    }
-    trace_skeleton(m, w, h)
-}
 
 /// Thin a padded mask (false border) to a 1px skeleton and follow it into polylines.
 fn trace_skeleton(mut m: Vec<bool>, w: usize, h: usize) -> Vec<(Vec<Vec2>, bool)> {

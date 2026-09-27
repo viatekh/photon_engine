@@ -95,11 +95,18 @@ pub struct Path {
     pub color: Rgb,
     /// Importance of the path per unit length (edge strength or brightness), used for culling.
     pub weight: f32,
+    /// Paths with the same group (other than NO_GROUP) are one shape: drawn together or not at all.
+    pub group: u32,
+    /// Whether auto detail can reduce this path (edge / threshold traces, not strokes or patterns).
+    pub detail_controlled: bool,
 }
+
+/// A path that is a shape on its own.
+pub const NO_GROUP: u32 = 0;
 
 impl Path {
     pub fn new(points: Vec<Vec2>, closed: bool, color: Rgb) -> Self {
-        Self { points, closed, color, weight: 1.0 }
+        Self { points, closed, color, weight: 1.0, group: NO_GROUP, detail_controlled: false }
     }
 
     /// Drawn length, including the closing segment of a closed path.

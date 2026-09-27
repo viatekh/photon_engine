@@ -109,6 +109,7 @@ fn pipeline(shared: Arc<Shared>) {
         if settings.source != source_sel {
             source = None;
             previous = None;
+            detail = AutoDetail::default();
             source_sel = settings.source.clone();
             retry_at = Instant::now();
         }

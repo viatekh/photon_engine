@@ -43,14 +43,21 @@ source frame ─► downsample ─► trace (centreline | outline) ─► smooth
             ─► keystone + clip ─► anti-breakup planner ─► colour/safety ─► DAC
 ```
 
-* **Tracing.** *Edges* (default) handles any content, including films and fractals: blur → gradient →
-  thin edges to single lines → link weak edges onto strong ones (Canny) → follow the edges as line art. Each path is
-  weighted by its edge contrast. *Centreline* thins bright areas to a 1px skeleton and follows it (best for line
+* **Tracing.** *Auto* (default) handles any content. Thin bright strokes are found with a ridge
+  detector and traced **once** down their middle; only line-like stroke components count (long
+  enough, few branches), so texture isn't mistaken for lines. Everything else (filled shapes,
+  film, fractals) is traced by its contrast edges, skipping edges that just border a stroke.
+* **Shapes.** Everything traced from one connected piece of the image is one *shape* (e.g. two
+  overlapping rings). The planner draws a shape completely or not at all. Minimum length applies
+  per shape, so a shape never loses small pieces. A shape too big to fit in a frame on its own is
+  split into its separate strokes (each still whole). This can be switched off.
+* Other modes: *Edges only* (Canny: blur → gradient → thin edges → link weak edges onto strong
+  ones → follow as line art; a thin line gives two edges). *Centreline* thins bright areas to a 1px skeleton and follows it (best for line
   content). *Outline* traces region edges with marching squares (works for anything, but a line
   becomes a loop: twice the scan time).
 * **Auto detail.** A feedback loop compares how many points the traced content would need with
-  the budget, and every frame raises or lowers the edge threshold, minimum stroke length and
-  (for very busy content) blur. A sparse frame gets more detail; a fractal keeps only its
+  the budget, and every frame raises or lowers the edge threshold, minimum shape size and
+  (for very busy content) edge blur. It resets when you change source. A sparse frame gets more detail; a fractal keeps only its
   strongest, longest structures. *Temporal smoothing* blends frames to reduce edge flicker on video.
 * **Scan model.** Paths are resampled so the beam never moves faster than the *lit speed* (blanked
   jumps use *blank speed*), with dwell at corners, path ends and blank transitions. Settings are in

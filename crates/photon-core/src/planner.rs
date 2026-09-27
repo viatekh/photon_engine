@@ -3,7 +3,8 @@
 //! The budget is `pps / refresh_hz` points. Every strategy ends with the whole-shapes pass,
 //! so whatever strategy is selected, a shape is either drawn completely or not at all.
 
-use crate::geom::{Path, Vec2};
+use crate::geom::{Path, Vec2, NO_GROUP};
+use std::collections::HashMap;
 use crate::scan::{self, ScanFrame, ScanParams};
 use crate::vectorise::simplify;
 use serde::{Deserialize, Serialize};
@@ -76,6 +77,9 @@ pub struct PlannerParams {
     pub max_groups: usize,
     /// 0..1 bonus for shapes drawn last frame, so the selection does not flicker.
     pub stickiness: f32,
+    /// A shape too big to draw in one frame on its own is split into its separate strokes
+    /// (each still drawn whole). Off = such shapes are never drawn.
+    pub split_oversized: bool,
 }
 
 impl Default for PlannerParams {
@@ -85,9 +89,10 @@ impl Default for PlannerParams {
             priority: Priority::Salient,
             target_hz: 40.0,
             min_hz: 25.0,
-            max_simplify: 0.02,
+            max_simplify: 0.008,
             max_groups: 3,
             stickiness: 0.5,
+            split_oversized: true,
         }
     }
 }
@@ -96,6 +101,8 @@ impl Default for PlannerParams {
 pub struct PlanStats {
     pub input_paths: usize,
     pub drawn_paths: usize,
+    pub input_shapes: usize,
+    pub drawn_shapes: usize,
     /// Points in the longest frame.
     pub points: usize,
     pub budget: usize,
@@ -105,6 +112,8 @@ pub struct PlanStats {
     pub groups: usize,
     /// Estimated points needed to draw every input path (for auto detail).
     pub demand: usize,
+    /// Part of `demand` from paths auto detail can reduce.
+    pub demand_controlled: usize,
     /// Points available across all groups (budget x groups for Take Turns).
     pub capacity: usize,
 }
@@ -133,33 +142,36 @@ impl Planner {
         let pps = scan.pps.max(1) as f32;
         let budget_for = |hz: f32| (pps / hz.max(1.0)).floor() as usize;
         let input_paths = paths.len();
-        let demand = paths.iter().map(|p| scan::lit_cost(p, scan)).sum::<usize>()
-            + paths.len() * scan.blank_cost(0.1);
+        let input_shapes = shape_count(&paths);
+        let cost = |p: &Path| scan::lit_cost(p, scan) + scan.blank_cost(0.1);
+        let demand: usize = paths.iter().map(cost).sum();
+        let demand_controlled: usize = paths.iter().filter(|p| p.detail_controlled).map(cost).sum();
 
+        let split = params.split_oversized;
         // Rank once; every strategy works through this order.
         let mut ranked = self.rank(paths, params);
 
         let (groups, dropped, simplify_used, budget) = match params.strategy {
             Strategy::WholeShapes => {
                 let b = budget_for(params.target_hz);
-                let (sel, drop) = whole_shapes(ranked, scan, b);
+                let (sel, drop) = whole_shapes(ranked, scan, b, split);
                 (vec![sel], drop, 0.0, b)
             }
             Strategy::Simplify => {
                 let b = budget_for(params.target_hz);
                 let (paths, eps) = simplify_to_fit(ranked, scan, b, params.max_simplify);
-                let (sel, drop) = whole_shapes(paths, scan, b);
+                let (sel, drop) = whole_shapes(paths, scan, b, split);
                 (vec![sel], drop, eps, b)
             }
             Strategy::AdaptiveRefresh => {
                 let b = budget_for(params.min_hz);
-                let (sel, drop) = whole_shapes(ranked, scan, b);
+                let (sel, drop) = whole_shapes(ranked, scan, b, split);
                 (vec![sel], drop, 0.0, b)
             }
             Strategy::Combined => {
                 let b = budget_for(params.min_hz);
                 let (paths, eps) = simplify_to_fit(ranked, scan, b, params.max_simplify);
-                let (sel, drop) = whole_shapes(paths, scan, b);
+                let (sel, drop) = whole_shapes(paths, scan, b, split);
                 (vec![sel], drop, eps, b)
             }
             Strategy::TakeTurns => {
@@ -169,7 +181,7 @@ impl Planner {
                     if ranked.is_empty() {
                         break;
                     }
-                    let (sel, rest) = whole_shapes(ranked, scan, b);
+                    let (sel, rest) = whole_shapes(ranked, scan, b, split);
                     if sel.is_empty() {
                         ranked = rest;
                         break;
@@ -192,12 +204,15 @@ impl Planner {
             stats: PlanStats {
                 input_paths,
                 drawn_paths: drawn.len(),
+                input_shapes,
+                drawn_shapes: shape_count(&drawn),
                 points,
                 budget,
                 refresh_hz,
                 simplify_used,
                 groups: frames.len(),
                 demand,
+                demand_controlled,
                 capacity: if params.strategy == Strategy::TakeTurns {
                     budget * params.max_groups.max(1)
                 } else {
@@ -210,9 +225,10 @@ impl Planner {
         }
     }
 
-    /// Sort paths by priority, best first. Shapes matching last frame's selection get a boost.
+    /// Sort by priority, best first, keeping each shape's paths together (a shape's score is the
+    /// sum of its paths'). Shapes matching last frame's selection get a boost.
     fn rank(&self, paths: Vec<Path>, params: &PlannerParams) -> Vec<Path> {
-        let mut scored: Vec<(f32, Path)> = paths
+        let scored: Vec<(f32, Path)> = paths
             .into_iter()
             .map(|p| {
                 let (lo, hi) = p.bounds();
@@ -234,50 +250,134 @@ impl Planner {
                 (s, p)
             })
             .collect();
-        scored.sort_by(|a, b| b.0.total_cmp(&a.0));
-        scored.into_iter().map(|(_, p)| p).collect()
+        // Per shape: summed score, total length and bounds.
+        let mut shapes_acc: HashMap<u32, (f32, f32, Vec2, Vec2)> = HashMap::new();
+        for (s, p) in &scored {
+            if p.group != NO_GROUP {
+                let (lo, hi) = p.bounds();
+                let e = shapes_acc
+                    .entry(p.group)
+                    .or_insert((0.0, 0.0, Vec2::new(f32::MAX, f32::MAX), Vec2::new(f32::MIN, f32::MIN)));
+                e.0 += s;
+                e.1 += p.length();
+                e.2 = Vec2::new(e.2.x.min(lo.x), e.2.y.min(lo.y));
+                e.3 = Vec2::new(e.3.x.max(hi.x), e.3.y.max(hi.y));
+            }
+        }
+        let salient = params.priority == Priority::Salient;
+        let shape_score: HashMap<u32, f32> = shapes_acc
+            .into_iter()
+            .map(|(g, (s, len, lo, hi))| {
+                // Salient: a tangle (much longer than it is big) is worth less than a clean
+                // contour of the same length. A circle has length/diagonal ~2.2; allow ~3.
+                let factor = if salient { (3.0 * lo.distance(hi) / len.max(1e-6)).min(1.0) } else { 1.0 };
+                (g, s * factor)
+            })
+            .collect();
+        // Sort key: (shape score, shape id, own score). Ungrouped paths are their own shape.
+        let mut keyed: Vec<(f32, u64, f32, Path)> = scored
+            .into_iter()
+            .enumerate()
+            .map(|(i, (s, p))| {
+                if p.group == NO_GROUP {
+                    (s, (1u64 << 32) + i as u64, s, p)
+                } else {
+                    (shape_score[&p.group], p.group as u64, s, p)
+                }
+            })
+            .collect();
+        keyed.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)).then(b.2.total_cmp(&a.2)));
+        keyed.into_iter().map(|(_, _, _, p)| p).collect()
     }
 }
 
-/// Greedily take whole paths (in the given order) whose rendered frame fits `budget`.
-/// Returns (selected, rejected), both in priority order.
-pub fn whole_shapes(ranked: Vec<Path>, scan: &ScanParams, budget: usize) -> (Vec<Path>, Vec<Path>) {
-    let mut selected: Vec<Path> = Vec::new();
-    let mut rejected: Vec<Path> = Vec::new();
-    let mut used = 0usize;
+/// Split a ranked list into shapes: consecutive paths sharing a group.
+fn shapes(ranked: Vec<Path>) -> Vec<Vec<Path>> {
+    let mut out: Vec<Vec<Path>> = Vec::new();
     for p in ranked {
-        let lit = scan::lit_cost(&p, scan);
-        // Estimate the extra blanking as a jump from the nearest selected endpoint and back.
-        let travel = selected
-            .iter()
-            .flat_map(|s| [s.start(), s.end()])
-            .map(|e| e.distance(p.start()).min(e.distance(p.end())))
-            .fold(f32::MAX, f32::min);
-        let travel = if selected.is_empty() { 0 } else { scan.blank_cost(travel) };
-        let closing = if p.closed { 0 } else { scan.blank_cost(p.start().distance(p.end())) };
-        let add = lit + travel + if selected.is_empty() { closing } else { 0 };
-        if used + add <= budget {
-            used += add;
-            selected.push(p);
-        } else {
-            rejected.push(p);
+        match out.last_mut() {
+            Some(last) if p.group != NO_GROUP && last[0].group == p.group => last.push(p),
+            _ => out.push(vec![p]),
         }
     }
-    // The estimate can be off (ordering differs); verify and shed lowest priority until it fits.
+    out
+}
+
+/// Number of distinct shapes in a list of paths.
+pub fn shape_count(paths: &[Path]) -> usize {
+    let mut groups: Vec<u32> = paths.iter().filter(|p| p.group != NO_GROUP).map(|p| p.group).collect();
+    groups.sort_unstable();
+    groups.dedup();
+    groups.len() + paths.iter().filter(|p| p.group == NO_GROUP).count()
+}
+
+/// Greedily take whole shapes (in the given order) whose rendered frame fits `budget`.
+/// A shape is every path sharing a group: it is taken or rejected as a unit.
+/// Returns (selected, rejected) paths, both in priority order.
+pub fn whole_shapes(
+    ranked: Vec<Path>,
+    scan: &ScanParams,
+    budget: usize,
+    split_oversized: bool,
+) -> (Vec<Path>, Vec<Path>) {
+    let mut selected: Vec<Vec<Path>> = Vec::new();
+    let mut rejected: Vec<Path> = Vec::new();
+    let mut used = 0usize;
+    let mut endpoints: Vec<Vec2> = Vec::new();
+    let mut queue: std::collections::VecDeque<Vec<Path>> = shapes(ranked).into();
+    while let Some(shape) = queue.pop_front() {
+        if split_oversized && shape.len() > 1 {
+            let alone: usize = shape.iter().map(|p| scan::lit_cost(p, scan) + scan.blank_cost(0.05)).sum();
+            if alone > budget {
+                // Can never fit whole: offer its strokes individually, in their own priority order.
+                for (i, p) in shape.into_iter().enumerate() {
+                    queue.insert(i, vec![p]);
+                }
+                continue;
+            }
+        }
+        let mut add = 0usize;
+        let mut ends = endpoints.clone();
+        for p in &shape {
+            add += scan::lit_cost(p, scan);
+            // Estimate blanking as a jump from the nearest endpoint already in the frame.
+            let near = ends
+                .iter()
+                .map(|e| e.distance(p.start()).min(e.distance(p.end())))
+                .fold(f32::MAX, f32::min);
+            if ends.is_empty() {
+                if !p.closed {
+                    add += scan.blank_cost(p.start().distance(p.end()));
+                }
+            } else {
+                add += scan.blank_cost(near);
+            }
+            ends.push(p.start());
+            ends.push(p.end());
+        }
+        if used + add <= budget {
+            used += add;
+            endpoints = ends;
+            selected.push(shape);
+        } else {
+            rejected.extend(shape);
+        }
+    }
+    // The estimate can be off (ordering differs); verify and shed lowest-priority shapes.
     loop {
-        let len = scan::render(&selected, scan).points.len();
+        let flat: Vec<Path> = selected.iter().flatten().cloned().collect();
+        let len = scan::render(&flat, scan).points.len();
         if selected.is_empty() || len <= budget {
             break;
         }
-        // Drop enough of the lowest-priority paths to cover the overshoot, then re-check.
         let mut shed = 0;
         while shed < len - budget {
-            let Some(p) = selected.pop() else { break };
-            shed += scan::lit_cost(&p, scan) + scan.blank_dwell_points() * 2;
-            rejected.push(p);
+            let Some(shape) = selected.pop() else { break };
+            shed += shape.iter().map(|p| scan::lit_cost(p, scan) + scan.blank_dwell_points() * 2).sum::<usize>();
+            rejected.extend(shape);
         }
     }
-    (selected, rejected)
+    (selected.into_iter().flatten().collect(), rejected)
 }
 
 /// Find the smallest simplification (up to `max_eps`) that makes everything fit.
@@ -400,6 +500,46 @@ mod tests {
         );
         assert!(d.stats.drawn_paths > a.stats.drawn_paths);
         assert!(d.stats.groups > 1);
+    }
+
+    #[test]
+    fn grouped_paths_are_drawn_all_or_nothing() {
+        let scan = ScanParams::default();
+        let params = PlannerParams { strategy: Strategy::WholeShapes, ..Default::default() };
+        let mut paths = many_circles();
+        // Split the big circle into quarter arcs sharing a group, plus give the small circles
+        // pairwise groups.
+        let big = paths.pop().unwrap();
+        for q in 0..4 {
+            let n = big.points.len();
+            let pts: Vec<Vec2> = (q * n / 4..=((q + 1) * n / 4).min(n - 1)).map(|i| big.points[i]).collect();
+            let mut arc = Path::new(pts, false, Rgb::WHITE);
+            arc.group = 1000;
+            paths.push(arc);
+        }
+        for (i, p) in paths.iter_mut().enumerate().take(64) {
+            p.group = 1 + (i / 2) as u32;
+        }
+        let plan = Planner::new().plan(paths, &scan, &params);
+        assert!(!plan.dropped.is_empty());
+        for d in &plan.drawn {
+            assert!(!plan.dropped.iter().any(|x| x.group == d.group), "group {} split", d.group);
+        }
+        assert!(plan.stats.drawn_shapes < plan.stats.drawn_paths);
+    }
+
+    #[test]
+    fn oversized_shape_splits_into_whole_strokes_only_when_allowed() {
+        let scan = ScanParams::default();
+        // All circles in one group: far too big for one frame.
+        let paths: Vec<Path> = many_circles().into_iter().map(|mut p| { p.group = 7; p }).collect();
+        let on = PlannerParams { strategy: Strategy::WholeShapes, ..Default::default() };
+        let plan = Planner::new().plan(paths.clone(), &scan, &on);
+        assert!(plan.stats.drawn_paths > 0);
+        assert!(plan.frames[0].points.len() <= plan.stats.budget);
+        let off = PlannerParams { split_oversized: false, ..on };
+        let plan = Planner::new().plan(paths, &scan, &off);
+        assert_eq!(plan.stats.drawn_paths, 0);
     }
 
     #[test]

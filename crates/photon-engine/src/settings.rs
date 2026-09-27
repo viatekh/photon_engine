@@ -14,6 +14,10 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
+    /// Bumped when tracing defaults change so old saved settings pick them up.
+    /// Missing in old files, so it must deserialize as 0 rather than the current version.
+    #[serde(default)]
+    pub version: u32,
     pub source: SourceSelection,
     pub flip_input_y: bool,
     pub test_pattern_on: bool,
@@ -31,9 +35,31 @@ pub struct Settings {
     pub static_beam_min_extent: f32,
 }
 
+pub const SETTINGS_VERSION: u32 = 3;
+
+impl Settings {
+    /// Bring settings saved by an older version up to date. Tracing / planning settings reset to
+    /// the new defaults; source, device, output geometry and colour are kept.
+    pub fn migrate(self) -> Self {
+        if self.version >= SETTINGS_VERSION {
+            return self;
+        }
+        log::info!("settings from version {} - resetting tracing defaults", self.version);
+        Settings {
+            source: self.source,
+            dac: self.dac,
+            geometry: self.geometry,
+            colour: self.colour,
+            scan: ScanParams { pps: self.scan.pps, ..Default::default() },
+            ..Default::default()
+        }
+    }
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            version: SETTINGS_VERSION,
             source: SourceSelection::None,
             flip_input_y: false,
             test_pattern_on: true,

@@ -169,6 +169,9 @@ fn settle(data: &[u8], w: usize, h: usize, strategy: Strategy) -> (usize, usize,
             assert!(f.points.len() <= plan.stats.budget);
         }
         detail.update(&plan.stats, &auto);
+        if std::env::var("DBG").is_ok() {
+            eprintln!("level {:.2} demand {} ctl {} cap {} drawn {}/{}", detail.level, plan.stats.demand, plan.stats.demand_controlled, plan.stats.capacity, plan.stats.drawn_paths, plan.stats.input_paths);
+        }
         last = (plan.stats.demand, plan.stats.capacity, plan.stats.drawn_paths, plan.stats.input_paths);
     }
     last
@@ -207,4 +210,89 @@ fn timing_fractal() {
         let _ = Planner::new().plan(paths, &ScanParams::default(), &PlannerParams::default());
     }
     println!("Edges/fractal: {paths_n} paths, {:.2} ms/frame", t.elapsed().as_secs_f64() * 1000.0 / n as f64);
+}
+
+// ------------------------------------------------------------------------------------------------
+// Auto mode on laser-style content (the case from the first on-device screenshot).
+
+fn rings_frame(rings: &[(f32, f32, f32)], line_y: Option<f32>) -> Vec<u8> {
+    let (w, h) = (960usize, 540usize);
+    let mut data = vec![0u8; w * h * 4];
+    let mut plot = |x: f32, y: f32| {
+        for dy in -1..=1 {
+            for dx in -1..=1 {
+                let (px, py) = (x as i32 + dx, y as i32 + dy);
+                if px >= 0 && py >= 0 && (px as usize) < w && (py as usize) < h {
+                    let i = (py as usize * w + px as usize) * 4;
+                    data[i..i + 4].copy_from_slice(&[0, 255, 60, 255]);
+                }
+            }
+        }
+    };
+    for &(cx, cy, r) in rings {
+        let steps = (r * 8.0) as usize;
+        for s in 0..steps {
+            let a = s as f32 / steps as f32 * std::f32::consts::TAU;
+            plot(cx + r * a.cos(), cy + r * a.sin());
+        }
+    }
+    if let Some(y) = line_y {
+        for x in 60..900 {
+            plot(x as f32, y);
+        }
+    }
+    data
+}
+
+fn auto_paths(data: &[u8]) -> Vec<photon_core::Path> {
+    let vp = VectoriseParams::default();
+    assert_eq!(vp.mode, TraceMode::Auto);
+    let img = WorkImage::from_frame(data, 960, 540, 960 * 4, PixelOrder::Rgba, vp.resolution, false);
+    vectorise(&img, &vp)
+}
+
+#[test]
+fn auto_traces_separate_rings_once_each() {
+    let data = rings_frame(&[(200.0, 200.0, 40.0), (500.0, 300.0, 60.0), (750.0, 150.0, 30.0)], None);
+    let paths = auto_paths(&data);
+    assert_eq!(paths.len(), 3, "{:#?}", paths.iter().map(|p| (p.closed, p.points.len())).collect::<Vec<_>>());
+    assert!(paths.iter().all(|p| p.closed));
+    // Each ring is its own shape.
+    let mut groups: Vec<u32> = paths.iter().map(|p| p.group).collect();
+    groups.dedup();
+    assert_eq!(groups.len(), 3);
+}
+
+#[test]
+fn auto_line_is_single_stroke_not_a_loop() {
+    let data = rings_frame(&[], Some(270.0));
+    let paths = auto_paths(&data);
+    assert_eq!(paths.len(), 1);
+    assert!(!paths[0].closed);
+}
+
+#[test]
+fn overlapping_rings_form_one_shape() {
+    let data = rings_frame(&[(400.0, 270.0, 60.0), (470.0, 270.0, 60.0)], None);
+    let paths = auto_paths(&data);
+    assert!(paths.len() >= 2);
+    let g = paths[0].group;
+    assert!(paths.iter().all(|p| p.group == g), "{:?}", paths.iter().map(|p| p.group).collect::<Vec<_>>());
+}
+
+#[test]
+fn auto_filled_shape_uses_its_outline() {
+    // A solid disc (too wide to be a stroke) should come out as one closed outline.
+    let (w, h) = (960usize, 540usize);
+    let mut data = vec![0u8; w * h * 4];
+    for y in 0..h {
+        for x in 0..w {
+            if ((x as f32 - 480.0).powi(2) + (y as f32 - 270.0).powi(2)).sqrt() < 120.0 {
+                data[(y * w + x) * 4..(y * w + x) * 4 + 4].copy_from_slice(&[255, 255, 255, 255]);
+            }
+        }
+    }
+    let paths = auto_paths(&data);
+    assert_eq!(paths.len(), 1, "{}", paths.len());
+    assert!(paths[0].closed);
 }

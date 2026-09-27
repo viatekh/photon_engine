@@ -29,7 +29,7 @@ pub struct AutoDetail {
 }
 
 const MIN_LEVEL: f32 = 0.25;
-const MAX_LEVEL: f32 = 40.0;
+const MAX_LEVEL: f32 = 12.0;
 
 impl Default for AutoDetail {
     fn default() -> Self {
@@ -46,10 +46,13 @@ impl AutoDetail {
         }
         let k = self.level;
         match p.mode {
-            TraceMode::Edges => {
+            TraceMode::Edges | TraceMode::Auto => {
                 p.edge_threshold = (base.edge_threshold * k.powf(0.6)).clamp(0.02, 1.2);
-                p.min_length_px = base.min_length_px * k.powf(0.7);
-                // Busy content: blur more so bold structure wins over fine texture.
+                // Min length is per shape, so this drops small fragments / texture, never
+                // pieces of a larger shape.
+                p.min_length_px = base.min_length_px * k;
+                // Busy content: blur edges more so bold structure wins over fine texture
+                // (strokes are detected on the unblurred image, so lines stay crisp).
                 if k > 1.0 {
                     p.blur_px = (base.blur_px + 0.6 * k.ln()).min(5.0);
                 }
@@ -62,6 +65,8 @@ impl AutoDetail {
     }
 
     /// Feed back the result of planning a frame traced with `apply`'s settings.
+    /// Only the detail-controlled share of the content is steered: it gets whatever budget the
+    /// rest (e.g. test patterns, which auto detail can't reduce) leaves over.
     pub fn update(&mut self, stats: &PlanStats, auto: &AutoDetailParams) {
         if !auto.enabled {
             self.level = 1.0;
@@ -71,7 +76,16 @@ impl AutoDetail {
         if target <= 0.0 {
             return;
         }
-        let ratio = (stats.demand as f32 / target).max(0.05);
+        let fixed = stats.demand.saturating_sub(stats.demand_controlled) as f32;
+        if stats.demand_controlled == 0 && fixed >= target * 0.85 {
+            // Uncontrolled content alone fills the budget: drift back to
+            // neutral rather than winding up. (With room left, zero controlled content means
+            // "look harder", handled below as a low ratio.)
+            self.level = 1.0 + (self.level - 1.0) * 0.9;
+            return;
+        }
+        let room = (target - fixed).max(target * 0.1);
+        let ratio = (stats.demand_controlled as f32 / room).max(0.05);
         // Dead band so a steady picture settles instead of hunting.
         if (0.85..=1.05).contains(&ratio) {
             return;
@@ -86,7 +100,7 @@ mod tests {
     use super::*;
 
     fn stats(demand: usize) -> PlanStats {
-        PlanStats { demand, capacity: 1000, ..Default::default() }
+        PlanStats { demand, demand_controlled: demand, capacity: 1000, ..Default::default() }
     }
 
     #[test]
@@ -109,6 +123,17 @@ mod tests {
             d.update(&stats(10), &auto);
         }
         assert_eq!(d.level, MIN_LEVEL);
+    }
+
+    #[test]
+    fn strokes_alone_do_not_wind_up_the_level() {
+        let auto = AutoDetailParams::default();
+        let mut d = AutoDetail::default();
+        let busy_strokes = PlanStats { demand: 5000, demand_controlled: 0, capacity: 1000, ..Default::default() };
+        for _ in 0..50 {
+            d.update(&busy_strokes, &auto);
+        }
+        assert!((d.level - 1.0).abs() < 0.01, "{}", d.level);
     }
 
     #[test]
