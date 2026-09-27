@@ -1,0 +1,8 @@
+[package]
+name = "photon-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+photon-core = { path = "../photon-core" }

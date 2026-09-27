@@ -1,0 +1,15 @@
+[workspace]
+resolver = "2"
+members = ["crates/photon-core", "crates/photon-engine"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "UNLICENSED"
+
+[profile.dev]
+# The vectoriser and planner run every frame; unoptimised builds are too slow to judge.
+opt-level = 2
+
+[profile.release]
+debug = 1
