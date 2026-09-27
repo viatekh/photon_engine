@@ -616,8 +616,9 @@ mod tests {
 
     #[test]
     fn shape_bigger_than_budget_is_never_partially_drawn() {
-        let scan = ScanParams { pps: 1000, ..Default::default() };
-        let params = PlannerParams { strategy: Strategy::WholeShapes, ..Default::default() };
+        let scan = ScanParams::default();
+        // 1000 Hz leaves a 30-point budget: far too small for the circle.
+        let params = PlannerParams { strategy: Strategy::WholeShapes, target_hz: 1000.0, ..Default::default() };
         let plan = Planner::new().plan(vec![circle(0.0, 0.0, 0.9, 64)], &scan, &params);
         assert_eq!(plan.stats.drawn_paths, 0);
         assert!(plan.frames.iter().all(|f| f.points.is_empty()));

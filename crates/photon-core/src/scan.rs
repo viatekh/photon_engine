@@ -1,7 +1,14 @@
 //! Converting paths into a point stream the scanners can physically follow.
 //!
-//! Speeds are in laser-space units per second (the field is 2.0 wide) and dwells are in
-//! microseconds, so the same settings behave the same at any point rate.
+//! Galvo mirrors have inertia, so the point stream is generated from a **motion profile**:
+//! the beam accelerates out of corners, cruises at up to the maximum speed, and brakes into
+//! corners and path ends, never exceeding the acceleration limit. Corner speed comes from how
+//! sharp the turn is (junction deviation, as in CNC / 3D printer planners) and from curvature,
+//! so gentle curves run at full speed while sharp corners come almost to rest - no fixed dwell
+//! points, no overshoot from slamming into a corner at full speed.
+//!
+//! Speeds are in laser-space units per second (the field is 2.0 wide), accelerations in
+//! units per second squared, holds in microseconds, so settings mean the same at any point rate.
 
 use crate::geom::{LaserPoint, Path, Rgb, Vec2};
 use serde::{Deserialize, Serialize};
@@ -11,27 +18,30 @@ use serde::{Deserialize, Serialize};
 pub struct ScanParams {
     /// Points per second sent to the DAC.
     pub pps: u32,
-    /// Galvo rating in kpps at ILDA 8 degrees (e.g. 30 for "30K scanners"). Speeds and dwells
-    /// below are specified for a 30K scanner and scaled by `scanner_kpps / 30`, so changing
-    /// this one number retunes everything for faster or slower scanners.
+    /// Galvo rating in kpps at ILDA 8 degrees (e.g. 30 for "30K scanners"). Speeds and
+    /// accelerations below are for a 30K scanner; speed scales with rating / 30, acceleration
+    /// with its square.
     pub scanner_kpps: f32,
-    /// Max beam speed while lit (at 30K). Faster = more content fits, but corners round off and the
-    /// line dims. Units: field widths/2 per second.
+    /// Max beam speed while lit.
     pub lit_speed: f32,
-    /// Max beam speed while blanked, jumping between shapes (at 30K).
+    /// Max acceleration while lit. Lower = smoother, less overshoot, more points per shape.
+    pub lit_accel: f32,
+    /// How far (laser units) a corner may be rounded off at speed. Lower = sharper corners,
+    /// slower through them.
+    pub corner_tolerance: f32,
+    /// Max beam speed while blanked (jumping between shapes).
     pub blank_speed: f32,
-    /// Extra time at a full 180-degree corner (scaled down for gentler corners).
-    pub corner_dwell_us: f32,
-    /// Direction changes below this many degrees get no corner dwell.
-    pub corner_min_angle: f32,
-    /// Lit hold at the start and end of every path (lets the mirrors catch up).
+    /// Max acceleration while blanked.
+    pub blank_accel: f32,
+    /// Lit hold at the start and end of every path.
     pub path_dwell_us: f32,
-    /// Blanked hold before a jump (lets the colour switch off) and after (lets mirrors settle).
-    pub blank_dwell_us: f32,
+    /// Blanked hold at the old position before a jump (lets the colour switch off).
+    pub blank_pre_us: f32,
+    /// Blanked hold at the new position after a jump (lets the mirrors settle).
+    pub blank_post_us: f32,
     /// Paths whose start is this close to the previous end are joined without blanking.
     pub join_distance: f32,
-    /// Closed shapes are drawn this much past their starting point (in time at lit speed),
-    /// hiding the gap mirror lag leaves at the seam.
+    /// Closed shapes are drawn this much past their starting point (in time at lit speed).
     pub closed_overlap_us: f32,
 }
 
@@ -40,16 +50,25 @@ impl Default for ScanParams {
         Self {
             pps: 30_000,
             scanner_kpps: 30.0,
-            lit_speed: 450.0,
-            blank_speed: 1500.0,
-            corner_dwell_us: 130.0,
-            corner_min_angle: 25.0,
-            path_dwell_us: 70.0,
-            blank_dwell_us: 100.0,
+            lit_speed: 600.0,
+            lit_accel: 1.2e6,
+            corner_tolerance: 0.003,
+            blank_speed: 1800.0,
+            blank_accel: 3.0e6,
+            path_dwell_us: 33.0,
+            blank_pre_us: 33.0,
+            blank_post_us: 130.0,
             join_distance: 0.004,
             closed_overlap_us: 0.0,
         }
     }
+}
+
+/// Speed / acceleration limits in per-point units.
+#[derive(Clone, Copy, Debug)]
+struct Limits {
+    vmax: f32,
+    accel: f32,
 }
 
 impl ScanParams {
@@ -57,34 +76,60 @@ impl ScanParams {
     fn scanner_factor(&self) -> f32 {
         (self.scanner_kpps / 30.0).clamp(0.1, 10.0)
     }
-    /// Dwell times shrink for faster scanners (they settle sooner).
+    fn pps_f(&self) -> f32 {
+        self.pps.max(1) as f32
+    }
+    /// Holds shrink for faster scanners (they settle sooner).
     pub fn points_for(&self, us: f32) -> usize {
-        (us / self.scanner_factor() * 1e-6 * self.pps as f32).round().max(0.0) as usize
+        (us / self.scanner_factor() * 1e-6 * self.pps_f()).round().max(0.0) as usize
     }
+    fn lit_limits(&self) -> Limits {
+        let f = self.scanner_factor();
+        Limits {
+            vmax: (self.lit_speed * f / self.pps_f()).max(1e-5),
+            accel: (self.lit_accel * f * f / (self.pps_f() * self.pps_f())).max(1e-8),
+        }
+    }
+    fn blank_limits(&self) -> Limits {
+        let f = self.scanner_factor();
+        Limits {
+            vmax: (self.blank_speed * f / self.pps_f()).max(1e-5),
+            accel: (self.blank_accel * f * f / (self.pps_f() * self.pps_f())).max(1e-8),
+        }
+    }
+    /// Largest distance between consecutive lit points.
     pub fn lit_step(&self) -> f32 {
-        (self.lit_speed * self.scanner_factor() / self.pps.max(1) as f32).max(1e-5)
+        self.lit_limits().vmax
     }
+    /// Largest distance between consecutive blanked points.
     pub fn blank_step(&self) -> f32 {
-        (self.blank_speed * self.scanner_factor() / self.pps.max(1) as f32).max(1e-5)
-    }
-    pub fn corner_points(&self) -> usize {
-        self.points_for(self.corner_dwell_us)
+        self.blank_limits().vmax
     }
     pub fn path_dwell_points(&self) -> usize {
         self.points_for(self.path_dwell_us)
     }
+    /// Blanked hold points around a jump (before + after).
     pub fn blank_dwell_points(&self) -> usize {
-        self.points_for(self.blank_dwell_us)
+        self.points_for(self.blank_pre_us) + self.points_for(self.blank_post_us)
     }
 
-    /// Number of points a blanked jump of `distance` costs.
+    /// Number of points a blanked jump of `distance` costs (rest to rest, plus holds).
     pub fn blank_cost(&self, distance: f32) -> usize {
         if distance <= self.join_distance {
-            0
-        } else {
-            2 * self.blank_dwell_points() + (distance / self.blank_step()).ceil() as usize
+            return 0;
         }
+        self.blank_dwell_points() + travel_points(distance, self.blank_limits())
     }
+}
+
+/// Points needed to travel `d` from rest to rest with the given limits.
+fn travel_points(d: f32, l: Limits) -> usize {
+    let t = if d < l.vmax * l.vmax / l.accel {
+        2.0 * (d / l.accel).sqrt()
+    } else {
+        d / l.vmax + l.vmax / l.accel
+    };
+    t.ceil().max(1.0) as usize
 }
 
 /// One loopable frame of points. The last point leads back into the first.
@@ -112,89 +157,138 @@ fn oriented(path: &Path, reversed: bool, start: usize) -> Vec<Vec2> {
     pts
 }
 
-/// Emit the lit points for an already-oriented polyline.
-fn emit_lit(pts: &[Vec2], color: Rgb, params: &ScanParams, closed: bool, out: &mut Vec<LaserPoint>) {
-    let step = params.lit_step();
-    let dwell = params.path_dwell_points();
-    let corner = params.corner_points() as f32;
-    let min_angle = params.corner_min_angle.to_radians();
-
-    for _ in 0..dwell.max(1) {
-        out.push(LaserPoint::lit(pts[0], color));
+/// Walk a polyline with a motion profile, pushing one point per sample period.
+/// Starts and ends at rest. `make` builds the point (lit or blank) for a position.
+fn walk(pts: &[Vec2], l: Limits, corner_tol: f32, out: &mut Vec<LaserPoint>, make: &dyn Fn(Vec2) -> LaserPoint) {
+    let n = pts.len();
+    if n < 2 {
+        return;
     }
-    for i in 1..pts.len() {
-        let (a, b) = (pts[i - 1], pts[i]);
-        let n = (a.distance(b) / step).ceil().max(1.0) as usize;
-        for k in 1..=n {
-            out.push(LaserPoint::lit(a.lerp(b, k as f32 / n as f32), color));
+    let seg_len: Vec<f32> = pts.windows(2).map(|w| w[0].distance(w[1])).collect();
+    // Speed allowed at each vertex from the corner, then limited by braking distance both ways.
+    let mut v = vec![l.vmax; n];
+    v[0] = 0.0;
+    v[n - 1] = 0.0;
+    for i in 1..n - 1 {
+        v[i] = corner_speed(pts[i - 1], pts[i], pts[i + 1], l, corner_tol);
+    }
+    for i in 1..n {
+        v[i] = v[i].min((v[i - 1] * v[i - 1] + 2.0 * l.accel * seg_len[i - 1]).sqrt());
+    }
+    for i in (0..n - 1).rev() {
+        v[i] = v[i].min((v[i + 1] * v[i + 1] + 2.0 * l.accel * seg_len[i]).sqrt());
+    }
+    // Speed at distance s into segment i (trapezoid / triangle profile).
+    let speed_at = |i: usize, s: f32| -> f32 {
+        let len = seg_len[i];
+        let a = (v[i] * v[i] + 2.0 * l.accel * s.max(0.0)).sqrt();
+        let b = (v[i + 1] * v[i + 1] + 2.0 * l.accel * (len - s).max(0.0)).sqrt();
+        l.vmax.min(a).min(b)
+    };
+    // The first step from rest covers accel/2; never step less, so the walk can't stall.
+    let min_step = (l.accel * 0.5).min(l.vmax).max(1e-6);
+    let mut i = 0usize;
+    let mut s = 0.0f32;
+    loop {
+        // Midpoint estimate of the distance covered in one sample period.
+        let v0 = speed_at(i, s);
+        let step = speed_at(i, s + v0 * 0.5).max(min_step);
+        let mut s_next = s + step;
+        // Crossing vertices: stop exactly on a vertex we must (nearly) stop at; otherwise
+        // carry the remaining distance into the next segment.
+        while s_next >= seg_len[i] {
+            if i + 1 == n - 1 {
+                out.push(make(pts[n - 1]));
+                return;
+            }
+            if v[i + 1] < 0.25 * l.vmax {
+                s_next = seg_len[i];
+                break;
+            }
+            s_next -= seg_len[i];
+            i += 1;
         }
-        // Corner dwell at interior vertices (and at the seam of a closed path).
-        let next = if i + 1 < pts.len() {
-            Some(pts[i + 1])
-        } else if closed && pts.len() > 2 {
-            Some(pts[1])
+        s = s_next;
+        if s >= seg_len[i] {
+            // Landed exactly on a slow vertex: emit it and move on.
+            out.push(make(pts[i + 1]));
+            i += 1;
+            s = 0.0;
+            if i == n - 1 {
+                return;
+            }
         } else {
-            None
-        };
-        if let Some(c) = next {
-            let angle = turn_angle(a, b, c);
-            if angle > min_angle && i + 1 < pts.len() {
-                let extra = (corner * angle / std::f32::consts::PI).round() as usize;
-                for _ in 0..extra {
-                    out.push(LaserPoint::lit(b, color));
-                }
-            }
+            out.push(make(pts[i].lerp(pts[i + 1], s / seg_len[i].max(1e-9))));
         }
-    }
-    // Closed shapes: keep drawing a little past the seam so mirror lag doesn't leave a gap.
-    let overlap = params.points_for(params.closed_overlap_us);
-    if closed && overlap > 0 && pts.len() > 2 {
-        let mut left = overlap;
-        'walk: for i in 1..pts.len() {
-            let (a, b) = (pts[i - 1], pts[i]);
-            let n = (a.distance(b) / step).ceil().max(1.0) as usize;
-            for k in 1..=n {
-                out.push(LaserPoint::lit(a.lerp(b, k as f32 / n as f32), color));
-                left -= 1;
-                if left == 0 {
-                    break 'walk;
-                }
-            }
-        }
-    }
-    let end = out.last().map(|p| p.pos()).unwrap_or(pts[pts.len() - 1]);
-    for _ in 0..dwell {
-        out.push(LaserPoint::lit(end, color));
     }
 }
 
-/// Direction change at `b` in radians (0 = straight on, PI = full reversal).
-fn turn_angle(a: Vec2, b: Vec2, c: Vec2) -> f32 {
+/// Max speed through vertex `b` between segments a-b and b-c.
+fn corner_speed(a: Vec2, b: Vec2, c: Vec2, l: Limits, tol: f32) -> f32 {
     let (d1, d2) = (b - a, c - b);
     let (l1, l2) = (d1.length(), d2.length());
     if l1 < 1e-9 || l2 < 1e-9 {
         return 0.0;
     }
-    (d1.dot(d2) / (l1 * l2)).clamp(-1.0, 1.0).acos()
+    // Turn angle: 0 = straight on, PI = full reversal.
+    let turn = (d1.dot(d2) / (l1 * l2)).clamp(-1.0, 1.0).acos();
+    if turn < 1e-4 {
+        return l.vmax;
+    }
+    // Junction deviation: the corner may be rounded off by at most `tol`.
+    let half = ((std::f32::consts::PI - turn) * 0.5).sin(); // sin(angle between segments / 2)
+    let junction = if half >= 0.9999 {
+        l.vmax
+    } else {
+        (l.accel * tol.max(1e-6) * half / (1.0 - half)).sqrt()
+    };
+    // Curvature: treat the vertex as part of an arc through the shorter neighbouring segment.
+    let radius = l1.min(l2) / (2.0 * (turn * 0.5).sin());
+    let centripetal = (l.accel * radius).sqrt();
+    l.vmax.min(junction).min(centripetal)
 }
 
-/// Blanked move with dwell at both ends. Eases in/out to reduce mirror overshoot.
+/// Emit the lit points for an already-oriented polyline.
+fn emit_lit(pts: &[Vec2], color: Rgb, params: &ScanParams, closed: bool, out: &mut Vec<LaserPoint>) {
+    let dwell = params.path_dwell_points();
+    let lit = |p: Vec2| LaserPoint::lit(p, color);
+    for _ in 0..dwell.max(1) {
+        out.push(lit(pts[0]));
+    }
+    let mut path: Vec<Vec2> = pts.to_vec();
+    // Closed shapes: continue a little past the seam so mirror lag doesn't leave a gap.
+    if closed && pts.len() > 2 {
+        let mut extra = params.lit_step() * params.points_for(params.closed_overlap_us) as f32;
+        for i in 1..pts.len() {
+            if extra <= 0.0 {
+                break;
+            }
+            let d = pts[i - 1].distance(pts[i]);
+            if d >= extra {
+                path.push(pts[i - 1].lerp(pts[i], extra / d.max(1e-9)));
+                break;
+            }
+            path.push(pts[i]);
+            extra -= d;
+        }
+    }
+    walk(&path, params.lit_limits(), params.corner_tolerance, out, &lit);
+    let end = out.last().map(|p| p.pos()).unwrap_or(pts[pts.len() - 1]);
+    for _ in 0..dwell {
+        out.push(lit(end));
+    }
+}
+
+/// Blanked move from rest to rest, with holds at both ends.
 pub fn emit_blank(from: Vec2, to: Vec2, params: &ScanParams, out: &mut Vec<LaserPoint>) {
-    let d = from.distance(to);
-    if d <= params.join_distance {
+    if from.distance(to) <= params.join_distance {
         return;
     }
-    let dwell = params.blank_dwell_points();
-    for _ in 0..dwell {
+    for _ in 0..params.points_for(params.blank_pre_us) {
         out.push(LaserPoint::blank(from));
     }
-    let n = (d / params.blank_step()).ceil().max(1.0) as usize;
-    for k in 1..=n {
-        let t = k as f32 / n as f32;
-        let eased = 0.5 - 0.5 * (std::f32::consts::PI * t).cos();
-        out.push(LaserPoint::blank(from.lerp(to, eased)));
-    }
-    for _ in 0..dwell {
+    walk(&[from, to], params.blank_limits(), 0.0, out, &LaserPoint::blank);
+    for _ in 0..params.points_for(params.blank_post_us) {
         out.push(LaserPoint::blank(to));
     }
 }
@@ -302,8 +396,48 @@ mod tests {
             }
         }
         assert!(max_lit <= params.lit_step() * 1.001, "{max_lit}");
-        // Eased moves peak at PI/2 times the average step.
-        assert!(max_blank <= params.blank_step() * 1.6, "{max_blank}");
+        assert!(max_blank <= params.blank_step() * 1.001, "{max_blank}");
+    }
+
+    /// Speed changes point to point stay within the acceleration limit (lit and blanked),
+    /// except the deliberate near-stops at sharp corners.
+    #[test]
+    fn acceleration_is_limited() {
+        let params = ScanParams::default();
+        let tri = Path::new(
+            vec![Vec2::new(-0.8, -0.6), Vec2::new(0.8, -0.6), Vec2::new(0.0, 0.8)],
+            true,
+            Rgb::WHITE,
+        );
+        let circle = Path::new(
+            (0..48)
+                .map(|i| {
+                    let a = i as f32 / 48.0 * std::f32::consts::TAU;
+                    Vec2::new(0.5 * a.cos(), 0.5 * a.sin())
+                })
+                .collect(),
+            true,
+            Rgb::WHITE,
+        );
+        let frame = render(&[tri, circle], &params);
+        let pts = &frame.points;
+        let (la, ba) = (params.lit_limits().accel, params.blank_limits().accel);
+        for i in 1..pts.len() - 1 {
+            let v1 = pts[i].pos() - pts[i - 1].pos();
+            let v2 = pts[i + 1].pos() - pts[i].pos();
+            let dv = (v2.length() - v1.length()).abs();
+            let limit = if pts[i].is_lit() { la } else { ba };
+            assert!(dv <= limit * 1.6 + 1e-5, "speed change {dv} > {limit} at {i}");
+        }
+    }
+
+    #[test]
+    fn sharp_corners_slow_down_gentle_curves_do_not() {
+        let l = ScanParams::default().lit_limits();
+        let sharp = corner_speed(Vec2::new(0.0, 0.0), Vec2::new(1.0, 0.0), Vec2::new(1.0, 1.0), l, 0.003);
+        let gentle = corner_speed(Vec2::new(0.0, 0.0), Vec2::new(0.5, 0.0), Vec2::new(1.0, 0.02), l, 0.003);
+        assert!(sharp < 0.2 * l.vmax, "{sharp}");
+        assert!(gentle > 0.9 * l.vmax, "{gentle}");
     }
 
     #[test]
@@ -344,7 +478,7 @@ mod tests {
         let a = render(&[sq.clone()], &base).points;
         let b = render(&[sq], &over).points;
         let lit = |v: &[LaserPoint]| v.iter().filter(|p| p.is_lit()).count();
-        assert_eq!(lit(&b), lit(&a) + over.points_for(300.0));
+        assert!(lit(&b) > lit(&a) + 3, "{} vs {}", lit(&b), lit(&a));
         // Loops seamlessly: every step (including the blanked return) within limits.
         for i in 0..b.len() {
             let d = b[i].pos().distance(b[(i + 1) % b.len()].pos());

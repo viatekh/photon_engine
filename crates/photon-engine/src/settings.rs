@@ -35,7 +35,7 @@ pub struct Settings {
     pub static_beam_min_extent: f32,
 }
 
-pub const SETTINGS_VERSION: u32 = 3;
+pub const SETTINGS_VERSION: u32 = 4;
 
 impl Settings {
     /// Bring settings saved by an older version up to date. Tracing / planning settings reset to
@@ -49,8 +49,9 @@ impl Settings {
             source: self.source,
             dac: self.dac,
             geometry: self.geometry,
-            colour: self.colour,
-            scan: ScanParams { pps: self.scan.pps, ..Default::default() },
+            // Colour keeps brightness/levels but takes the new colour delay default.
+            colour: ColourParams { colour_delay_us: ColourParams::default().colour_delay_us, ..self.colour },
+            scan: ScanParams { pps: self.scan.pps, scanner_kpps: self.scan.scanner_kpps, ..Default::default() },
             ..Default::default()
         }
     }

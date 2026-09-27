@@ -290,7 +290,8 @@ impl App {
             ui.add(egui::Slider::new(&mut c.green, 0.0..=1.0).text("Green"));
             ui.add(egui::Slider::new(&mut c.blue, 0.0..=1.0).text("Blue"));
             ui.add(egui::Slider::new(&mut c.min_level, 0.0..=0.5).text("Min level"));
-            ui.add(egui::Slider::new(&mut c.colour_delay, 0..=20).text("Colour delay (pts)"));
+            ui.add(egui::Slider::new(&mut c.colour_delay_us, 0.0..=500.0).text("Colour delay (µs)"))
+                .on_hover_text("Delays colour to line up with the lagging mirrors. If lines start early / stop short (gap at the end of a closed shape), increase; if they overshoot at the start, decrease. LaserCube default ~133.");
             ui.horizontal(|ui| {
                 ui.checkbox(&mut s.geometry.flip_x, "Flip X");
                 ui.checkbox(&mut s.geometry.flip_y, "Flip Y");
@@ -314,13 +315,19 @@ impl App {
 
         egui::CollapsingHeader::new("Scanner tuning").default_open(false).show(ui, |ui| {
             let sc = &mut s.scan;
-            ui.small("Speeds and dwells are for a 30K scanner; the scanner rating above scales them.");
-            ui.add(egui::Slider::new(&mut sc.lit_speed, 50.0..=2000.0).text("Lit speed"));
-            ui.add(egui::Slider::new(&mut sc.blank_speed, 100.0..=5000.0).text("Blank speed"));
-            ui.add(egui::Slider::new(&mut sc.corner_dwell_us, 0.0..=500.0).text("Corner dwell (µs)"));
-            ui.add(egui::Slider::new(&mut sc.corner_min_angle, 0.0..=90.0).text("Corner angle (°)"));
-            ui.add(egui::Slider::new(&mut sc.path_dwell_us, 0.0..=500.0).text("Path end dwell (µs)"));
-            ui.add(egui::Slider::new(&mut sc.blank_dwell_us, 0.0..=500.0).text("Blank dwell (µs)"));
+            ui.small("Values are for a 30K scanner; the scanner rating above scales them.");
+            ui.add(egui::Slider::new(&mut sc.lit_speed, 100.0..=2000.0).text("Lit speed"))
+                .on_hover_text("Top speed while drawing (field units per second; the field is 2 wide).");
+            ui.add(egui::Slider::new(&mut sc.lit_accel, 2e5..=6e6).logarithmic(true).text("Lit acceleration"))
+                .on_hover_text("Lower = smoother lines, less wobble/overshoot, but more points per shape.");
+            ui.add(egui::Slider::new(&mut sc.corner_tolerance, 0.0005..=0.02).logarithmic(true).text("Corner rounding"))
+                .on_hover_text("How much a corner may be rounded at speed. Lower = sharper corners, slower through them.");
+            ui.add(egui::Slider::new(&mut sc.blank_speed, 200.0..=6000.0).text("Blank speed"));
+            ui.add(egui::Slider::new(&mut sc.blank_accel, 2e5..=1.5e7).logarithmic(true).text("Blank acceleration"));
+            ui.add(egui::Slider::new(&mut sc.path_dwell_us, 0.0..=300.0).text("Path end hold (µs)"));
+            ui.add(egui::Slider::new(&mut sc.blank_pre_us, 0.0..=300.0).text("Blank hold before jump (µs)"));
+            ui.add(egui::Slider::new(&mut sc.blank_post_us, 0.0..=600.0).text("Settle after jump (µs)"))
+                .on_hover_text("Blanked wait at the new position before lighting up. Increase if lines have a bright/bent tail at their start.");
             ui.add(egui::Slider::new(&mut sc.closed_overlap_us, 0.0..=1000.0).text("Closed-shape overlap (µs)"))
                 .on_hover_text("Draw closed shapes a little past their start so they close fully despite mirror lag.");
             ui.separator();

@@ -369,7 +369,7 @@ impl Player {
         let mut frame = match reason {
             Some(_) => Vec::new(),
             None => {
-                let f = settings.colour.apply(points);
+                let f = settings.colour.apply(points, settings.scan.pps);
                 if is_static_beam(&f, settings.static_beam_min_extent) {
                     self.blanked = Some("static beam blocked");
                     blank_frame(&f)

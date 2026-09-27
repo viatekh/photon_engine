@@ -14,24 +14,29 @@ pub struct ColourParams {
     /// Level a lit channel starts at, for diodes that don't emit below a threshold.
     /// A lit value v becomes min + v * (1 - min); zero stays zero.
     pub min_level: f32,
-    /// Shift colour this many points later than position, to line up with the mirrors.
-    pub colour_delay: usize,
+    /// Delay colour relative to position, so colour changes line up with where the (lagging)
+    /// mirrors actually are. Wicked Lasers' LaserCube default is 4 samples at 30k = ~133 us.
+    pub colour_delay_us: f32,
 }
 
 impl Default for ColourParams {
     fn default() -> Self {
-        Self { brightness: 0.3, red: 1.0, green: 1.0, blue: 1.0, min_level: 0.0, colour_delay: 0 }
+        Self { brightness: 0.3, red: 1.0, green: 1.0, blue: 1.0, min_level: 0.0, colour_delay_us: 133.0 }
     }
 }
 
 impl ColourParams {
+    pub fn delay_points(&self, pps: u32) -> usize {
+        (self.colour_delay_us.max(0.0) * 1e-6 * pps as f32).round() as usize
+    }
+
     /// Apply to a loopable frame. Delay rotates colour through the loop, so it is seamless.
-    pub fn apply(&self, frame: &[LaserPoint]) -> Vec<LaserPoint> {
+    pub fn apply(&self, frame: &[LaserPoint], pps: u32) -> Vec<LaserPoint> {
         let n = frame.len();
         if n == 0 {
             return Vec::new();
         }
-        let delay = self.colour_delay % n;
+        let delay = self.delay_points(pps) % n;
         let level = |v: f32, gain: f32| {
             let v = (v * gain * self.brightness).clamp(0.0, 1.0);
             if v <= 0.0 { 0.0 } else { self.min_level + v * (1.0 - self.min_level) }
@@ -86,8 +91,9 @@ mod tests {
                 LaserPoint::lit(Vec2::new(i as f32 * 0.1, 0.0), c)
             })
             .collect();
-        let p = ColourParams { brightness: 1.0, colour_delay: 1, ..Default::default() };
-        let out = p.apply(&frame);
+        // 1 point at 30k pps.
+        let p = ColourParams { brightness: 1.0, colour_delay_us: 1e6 / 30_000.0, ..Default::default() };
+        let out = p.apply(&frame, 30_000);
         assert!(!out[0].is_lit());
         assert!(out[1].is_lit());
         assert_eq!(out[1].x, 0.1);
@@ -96,8 +102,8 @@ mod tests {
     #[test]
     fn brightness_and_min_level() {
         let frame = vec![LaserPoint::lit(Vec2::ZERO, Rgb::new(1.0, 0.0, 0.5))];
-        let p = ColourParams { brightness: 0.5, min_level: 0.2, ..Default::default() };
-        let out = p.apply(&frame)[0];
+        let p = ColourParams { brightness: 0.5, min_level: 0.2, colour_delay_us: 0.0, ..Default::default() };
+        let out = p.apply(&frame, 30_000)[0];
         assert!((out.r - (0.2 + 0.5 * 0.8)).abs() < 1e-6);
         assert_eq!(out.g, 0.0);
     }

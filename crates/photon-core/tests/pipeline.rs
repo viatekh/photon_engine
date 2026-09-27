@@ -54,7 +54,7 @@ fn run(rings: usize, mode: TraceMode, strategy: Strategy) -> (usize, usize, usiz
     let plan = Planner::new().plan(paths, &scan, &params);
     for f in &plan.frames {
         assert!(f.points.len() <= plan.stats.budget);
-        let out = ColourParams::default().apply(&f.points);
+        let out = ColourParams::default().apply(&f.points, 30_000);
         assert!(out.iter().all(|p| p.x.abs() <= 1.0 && p.y.abs() <= 1.0));
     }
     (plan.stats.input_paths, plan.stats.drawn_paths, plan.stats.points, plan.stats.budget)
