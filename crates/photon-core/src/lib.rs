@@ -10,6 +10,7 @@ pub mod output;
 pub mod patterns;
 pub mod planner;
 pub mod scan;
+pub mod tracker;
 pub mod vectorise;
 
 pub use geom::{LaserPoint, Path, Rgb, Vec2};

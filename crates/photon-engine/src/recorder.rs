@@ -172,6 +172,7 @@ fn path_json(p: &Path) -> Value {
     let pts: Vec<f32> = p.points.iter().flat_map(|v| [round(v.x, 4), round(v.y, 4)]).collect();
     json!({
         "g": p.group,
+        "tr": p.track,
         "c": [round(p.color.r, 2), round(p.color.g, 2), round(p.color.b, 2)],
         "wt": round(p.weight, 3),
         "cl": p.closed,

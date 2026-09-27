@@ -263,6 +263,17 @@ impl App {
             ui.add(egui::Slider::new(&mut p.max_simplify, 0.0..=0.1).text("Max simplify"));
             ui.add(egui::Slider::new(&mut p.max_groups, 1..=6).text("Max groups (D)"));
             ui.add(egui::Slider::new(&mut p.stickiness, 0.0..=2.0).text("Selection stickiness"));
+            ui.separator();
+            ui.checkbox(&mut p.tracking.enabled, "Object permanence (track shapes)")
+                .on_hover_text("Follow shapes between frames: stable seams, hold through brief dropouts, ignore one-frame noise.");
+            ui.add_enabled_ui(p.tracking.enabled, |ui| {
+                ui.checkbox(&mut p.commit, "Commit to shapes on screen")
+                    .on_hover_text("Shapes being drawn always come before new ones: a new shape appears only when there's room.");
+                ui.add(egui::Slider::new(&mut p.tracking.confirm_frames, 1..=5).text("New shape delay (frames)"))
+                    .on_hover_text("A new shape must be seen this many frames before it's drawn. 2 = one-frame noise never reaches the laser.");
+                ui.add(egui::Slider::new(&mut p.tracking.hold_frames, 0..=6).text("Hold lost shapes (frames)"))
+                    .on_hover_text("Keep drawing a shape this many frames after the tracing loses it.");
+            });
             ui.add(egui::Slider::new(&mut p.entry_margin, 0.0..=0.3).text("Entry margin"))
                 .on_hover_text("Hysteresis: a shape not already on screen only gets in if it fits with this fraction of the budget spare. Higher = steadier, slightly less content.");
             ui.checkbox(&mut p.split_oversized, "Split very large shapes into strokes")

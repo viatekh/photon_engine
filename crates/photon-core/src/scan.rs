@@ -318,7 +318,13 @@ fn order(paths: &[Path]) -> Vec<Choice> {
         let mut best = (f32::MAX, 0usize, false, 0usize); // (dist, slot, reversed, start)
         for (slot, &i) in remaining.iter().enumerate() {
             let p = &paths[i];
-            if p.closed {
+            if p.closed && p.fixed_start {
+                // Tracked shape: keep its seam and direction so it looks the same every frame.
+                let d = p.points[0].distance(pos);
+                if d < best.0 {
+                    best = (d, slot, false, 0);
+                }
+            } else if p.closed {
                 for (k, &v) in p.points.iter().enumerate() {
                     let d = v.distance(pos);
                     if d < best.0 {

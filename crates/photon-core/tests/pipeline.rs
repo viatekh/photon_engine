@@ -51,7 +51,10 @@ fn run(rings: usize, mode: TraceMode, strategy: Strategy) -> (usize, usize, usiz
     let paths = geometry.apply(&paths);
     let scan = ScanParams::default();
     let params = PlannerParams { strategy, ..Default::default() };
-    let plan = Planner::new().plan(paths, &scan, &params);
+    // Steady state: the same frame twice (object tracking confirms objects on the 2nd frame).
+    let mut planner = Planner::new();
+    planner.plan(paths.clone(), &scan, &params);
+    let plan = planner.plan(paths, &scan, &params);
     for f in &plan.frames {
         assert!(f.points.len() <= plan.stats.budget);
         let out = ColourParams::default().apply(&f.points, 30_000);
