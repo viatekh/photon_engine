@@ -33,6 +33,9 @@ const CMD_GET_VERSION_MINOR: u8 = 0x8C;
 const CMD_CLEAR_RINGBUFFER: u8 = 0x8D;
 const CMD_GET_BULK_PACKET_SAMPLES: u8 = 0x8E;
 
+/// Largest batch per bulk transfer (libLaserdockCore uses 768).
+const MAX_SAMPLES_PER_TRANSFER: usize = 768;
+
 /// Used when the device doesn't report its ring buffer state.
 const FALLBACK_BUFFER: usize = 1000;
 
@@ -159,7 +162,10 @@ impl Dac for LaserCubeUsb {
     }
 
     fn write(&mut self, points: &[LaserPoint]) -> anyhow::Result<()> {
-        for chunk in points.chunks(self.packet_samples) {
+        // One bulk transfer per batch, as libLaserdockCore does (it sends up to 768 samples at
+        // once). Splitting into many small transfers costs a USB round trip each, which on macOS
+        // can be slow enough to let the cube's small buffer run dry (the beam then stalls).
+        for chunk in points.chunks(MAX_SAMPLES_PER_TRANSFER) {
             self.bytes.clear();
             for p in chunk {
                 let c = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u16;

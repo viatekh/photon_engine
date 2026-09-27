@@ -30,6 +30,9 @@ pub struct ScanParams {
     pub blank_dwell_us: f32,
     /// Paths whose start is this close to the previous end are joined without blanking.
     pub join_distance: f32,
+    /// Closed shapes are drawn this much past their starting point (in time at lit speed),
+    /// hiding the gap mirror lag leaves at the seam.
+    pub closed_overlap_us: f32,
 }
 
 impl Default for ScanParams {
@@ -44,6 +47,7 @@ impl Default for ScanParams {
             path_dwell_us: 70.0,
             blank_dwell_us: 100.0,
             join_distance: 0.004,
+            closed_overlap_us: 0.0,
         }
     }
 }
@@ -54,7 +58,7 @@ impl ScanParams {
         (self.scanner_kpps / 30.0).clamp(0.1, 10.0)
     }
     /// Dwell times shrink for faster scanners (they settle sooner).
-    fn points_for(&self, us: f32) -> usize {
+    pub fn points_for(&self, us: f32) -> usize {
         (us / self.scanner_factor() * 1e-6 * self.pps as f32).round().max(0.0) as usize
     }
     pub fn lit_step(&self) -> f32 {
@@ -142,8 +146,25 @@ fn emit_lit(pts: &[Vec2], color: Rgb, params: &ScanParams, closed: bool, out: &m
             }
         }
     }
+    // Closed shapes: keep drawing a little past the seam so mirror lag doesn't leave a gap.
+    let overlap = params.points_for(params.closed_overlap_us);
+    if closed && overlap > 0 && pts.len() > 2 {
+        let mut left = overlap;
+        'walk: for i in 1..pts.len() {
+            let (a, b) = (pts[i - 1], pts[i]);
+            let n = (a.distance(b) / step).ceil().max(1.0) as usize;
+            for k in 1..=n {
+                out.push(LaserPoint::lit(a.lerp(b, k as f32 / n as f32), color));
+                left -= 1;
+                if left == 0 {
+                    break 'walk;
+                }
+            }
+        }
+    }
+    let end = out.last().map(|p| p.pos()).unwrap_or(pts[pts.len() - 1]);
     for _ in 0..dwell {
-        out.push(LaserPoint::lit(pts[pts.len() - 1], color));
+        out.push(LaserPoint::lit(end, color));
     }
 }
 
@@ -243,7 +264,7 @@ pub fn render(paths: &[Path], params: &ScanParams) -> ScanFrame {
         }
         first.get_or_insert(pts[0]);
         emit_lit(&pts, path.color, params, path.closed, &mut points);
-        pos = Some(pts[pts.len() - 1]);
+        pos = points.last().map(|p| p.pos());
     }
     if let (Some(p), Some(f)) = (pos, first) {
         emit_blank(p, f, params, &mut points);
@@ -309,6 +330,26 @@ mod tests {
         let idx = lit.iter().position(|p| (p.x - (-0.4)).abs() < 1e-4).unwrap();
         let idx_far = lit.iter().position(|p| (p.x - 0.5).abs() < 1e-4).unwrap();
         assert!(idx < idx_far);
+    }
+
+    #[test]
+    fn closed_overlap_draws_past_the_seam_without_jumps() {
+        let sq = Path::new(
+            vec![Vec2::new(-0.5, -0.5), Vec2::new(0.5, -0.5), Vec2::new(0.5, 0.5), Vec2::new(-0.5, 0.5)],
+            true,
+            Rgb::WHITE,
+        );
+        let base = ScanParams::default();
+        let over = ScanParams { closed_overlap_us: 300.0, ..Default::default() };
+        let a = render(&[sq.clone()], &base).points;
+        let b = render(&[sq], &over).points;
+        let lit = |v: &[LaserPoint]| v.iter().filter(|p| p.is_lit()).count();
+        assert_eq!(lit(&b), lit(&a) + over.points_for(300.0));
+        // Loops seamlessly: every step (including the blanked return) within limits.
+        for i in 0..b.len() {
+            let d = b[i].pos().distance(b[(i + 1) % b.len()].pos());
+            assert!(d <= over.blank_step() * 1.6, "{d}");
+        }
     }
 
     #[test]

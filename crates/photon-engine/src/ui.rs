@@ -321,6 +321,8 @@ impl App {
             ui.add(egui::Slider::new(&mut sc.corner_min_angle, 0.0..=90.0).text("Corner angle (°)"));
             ui.add(egui::Slider::new(&mut sc.path_dwell_us, 0.0..=500.0).text("Path end dwell (µs)"));
             ui.add(egui::Slider::new(&mut sc.blank_dwell_us, 0.0..=500.0).text("Blank dwell (µs)"));
+            ui.add(egui::Slider::new(&mut sc.closed_overlap_us, 0.0..=1000.0).text("Closed-shape overlap (µs)"))
+                .on_hover_text("Draw closed shapes a little past their start so they close fully despite mirror lag.");
             ui.separator();
             ui.add(egui::Slider::new(&mut s.signal_timeout_ms, 100..=3000).text("Signal-loss blackout (ms)"));
             ui.add(egui::Slider::new(&mut s.static_beam_min_extent, 0.0..=0.3).text("Static beam guard"));
@@ -378,6 +380,11 @@ impl App {
             }
             ui.separator();
             ui.label(format!("Output {:.0} passes/s", out.frames_per_sec));
+            if out.underruns > 0 {
+                ui.separator();
+                ui.colored_label(Color32::RED, format!("DAC underruns {}", out.underruns))
+                    .on_hover_text("The laser's buffer ran dry and the beam stalled. Try a lower point rate, or report this.");
+            }
         });
     }
 
