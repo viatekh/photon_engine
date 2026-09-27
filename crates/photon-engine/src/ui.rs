@@ -263,6 +263,8 @@ impl App {
             ui.add(egui::Slider::new(&mut p.max_simplify, 0.0..=0.1).text("Max simplify"));
             ui.add(egui::Slider::new(&mut p.max_groups, 1..=6).text("Max groups (D)"));
             ui.add(egui::Slider::new(&mut p.stickiness, 0.0..=2.0).text("Selection stickiness"));
+            ui.add(egui::Slider::new(&mut p.entry_margin, 0.0..=0.3).text("Entry margin"))
+                .on_hover_text("Hysteresis: a shape not already on screen only gets in if it fits with this fraction of the budget spare. Higher = steadier, slightly less content.");
             ui.checkbox(&mut p.split_oversized, "Split very large shapes into strokes")
                 .on_hover_text("A connected shape needing over half the frame is split into its separate strokes (each still drawn whole). Off: shapes are only drawn whole, so very large ones may not be drawn at all.");
         });

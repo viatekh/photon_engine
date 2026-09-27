@@ -296,3 +296,19 @@ fn auto_filled_shape_uses_its_outline() {
     assert_eq!(paths.len(), 1, "{}", paths.len());
     assert!(paths[0].closed);
 }
+
+#[test]
+#[ignore = "diagnostic"]
+fn stroke_stats() {
+    let vp = VectoriseParams::default();
+    eprintln!("--- rings");
+    let data = rings_frame(&[(400.0, 270.0, 60.0), (470.0, 270.0, 60.0), (430.0, 330.0, 50.0), (520.0, 300.0, 40.0), (360.0, 220.0, 35.0)], Some(250.0));
+    let img = WorkImage::from_frame(&data, 960, 540, 960 * 4, PixelOrder::Rgba, vp.resolution, false);
+    vectorise(&img, &vp);
+    for zoom in [40.0, 400.0, 4000.0] {
+        eprintln!("--- fractal zoom {zoom}");
+        let data = mandelbrot(960, 540, zoom);
+        let img = WorkImage::from_frame(&data, 960, 540, 960 * 4, PixelOrder::Rgba, vp.resolution, false);
+        vectorise(&img, &vp);
+    }
+}

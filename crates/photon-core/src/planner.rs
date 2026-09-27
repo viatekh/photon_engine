@@ -80,6 +80,9 @@ pub struct PlannerParams {
     /// A shape needing more than half a frame's budget is split into its separate strokes
     /// (each still drawn whole). Off = shapes are only ever drawn whole (big ones may never be).
     pub split_oversized: bool,
+    /// Hysteresis: a shape not drawn last frame only enters if it fits with this fraction of
+    /// the budget to spare. Stops shapes at the budget edge flickering in and out.
+    pub entry_margin: f32,
 }
 
 impl Default for PlannerParams {
@@ -93,6 +96,7 @@ impl Default for PlannerParams {
             max_groups: 3,
             stickiness: 0.5,
             split_oversized: true,
+            entry_margin: 0.08,
         }
     }
 }
@@ -150,30 +154,32 @@ impl Planner {
         let demand_controlled: usize = paths.iter().filter(|p| p.detail_controlled).map(cost).sum();
 
         let split = params.split_oversized;
+        let margin = params.entry_margin;
+        let incumbent = |shape: &[Path]| self.was_drawn(shape);
         // Rank once; every strategy works through this order.
         let mut ranked = self.rank(paths, params);
 
         let (groups, dropped, simplify_used, budget) = match params.strategy {
             Strategy::WholeShapes => {
                 let b = budget_for(params.target_hz);
-                let (sel, drop) = whole_shapes(ranked, scan, b, split);
+                let (sel, drop) = whole_shapes(ranked, scan, b, split, &incumbent, margin);
                 (vec![sel], drop, 0.0, b)
             }
             Strategy::Simplify => {
                 let b = budget_for(params.target_hz);
                 let (paths, eps) = simplify_to_fit(ranked, scan, b, params.max_simplify);
-                let (sel, drop) = whole_shapes(paths, scan, b, split);
+                let (sel, drop) = whole_shapes(paths, scan, b, split, &incumbent, margin);
                 (vec![sel], drop, eps, b)
             }
             Strategy::AdaptiveRefresh => {
                 let b = budget_for(params.min_hz);
-                let (sel, drop) = whole_shapes(ranked, scan, b, split);
+                let (sel, drop) = whole_shapes(ranked, scan, b, split, &incumbent, margin);
                 (vec![sel], drop, 0.0, b)
             }
             Strategy::Combined => {
                 let b = budget_for(params.min_hz);
                 let (paths, eps) = simplify_to_fit(ranked, scan, b, params.max_simplify);
-                let (sel, drop) = whole_shapes(paths, scan, b, split);
+                let (sel, drop) = whole_shapes(paths, scan, b, split, &incumbent, margin);
                 (vec![sel], drop, eps, b)
             }
             Strategy::TakeTurns => {
@@ -183,7 +189,7 @@ impl Planner {
                     if ranked.is_empty() {
                         break;
                     }
-                    let (sel, rest) = whole_shapes(ranked, scan, b, split);
+                    let (sel, rest) = whole_shapes(ranked, scan, b, split, &|_: &[Path]| false, 0.0);
                     if sel.is_empty() {
                         ranked = rest;
                         break;
@@ -226,6 +232,25 @@ impl Planner {
             drawn,
             dropped,
         }
+    }
+
+    /// Whether a shape was on screen last frame: as a whole shape, or mostly (by length) as
+    /// individual paths (which survives shapes merging, splitting or being split for size).
+    fn was_drawn(&self, shape: &[Path]) -> bool {
+        let similar = |(ac, al): (Vec2, f32), (bc, bl): (Vec2, f32)| {
+            ac.distance(bc) < 0.06 && (al - bl).abs() <= 0.35 * al.max(bl)
+        };
+        let len: f32 = shape.iter().map(|p| p.length()).sum();
+        let centre = shape.iter().fold(Vec2::ZERO, |a, p| a + p.centroid() * p.length()) * (1.0 / len.max(1e-6));
+        if self.previous_shapes.iter().any(|&prev| similar((centre, len), prev)) {
+            return true;
+        }
+        let seen: f32 = shape
+            .iter()
+            .filter(|p| self.previous.iter().any(|&prev| similar((p.centroid(), p.length()), prev)))
+            .map(|p| p.length())
+            .sum();
+        seen >= 0.5 * len
     }
 
     /// Sort by priority, best first, keeping each shape's paths together (a shape's score is the
@@ -350,12 +375,19 @@ pub fn shape_count(paths: &[Path]) -> usize {
 /// Greedily take whole shapes (in the given order) whose rendered frame fits `budget`.
 /// A shape is every path sharing a group: it is taken or rejected as a unit.
 /// Returns (selected, rejected) paths, both in priority order.
+///
+/// Hysteresis: a shape for which `incumbent` is true (it was on screen last frame) may use the
+/// whole budget; any other shape only gets in if it fits within `budget * (1 - entry_margin)`.
+/// So shapes at the edge of the budget don't alternate between drawn and dropped.
 pub fn whole_shapes(
     ranked: Vec<Path>,
     scan: &ScanParams,
     budget: usize,
     split_oversized: bool,
+    incumbent: &dyn Fn(&[Path]) -> bool,
+    entry_margin: f32,
 ) -> (Vec<Path>, Vec<Path>) {
+    let entry_budget = (budget as f32 * (1.0 - entry_margin.clamp(0.0, 0.5))) as usize;
     let mut selected: Vec<Vec<Path>> = Vec::new();
     let mut rejected: Vec<Path> = Vec::new();
     let mut used = 0usize;
@@ -394,7 +426,8 @@ pub fn whole_shapes(
             ends.push(p.start());
             ends.push(p.end());
         }
-        if used + add <= budget {
+        let limit = if incumbent(&shape) { budget } else { entry_budget };
+        if used + add <= limit {
             used += add;
             endpoints = ends;
             selected.push(shape);
