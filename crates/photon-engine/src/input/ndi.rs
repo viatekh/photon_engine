@@ -6,7 +6,9 @@ use libloading::Library;
 use photon_core::image::PixelOrder;
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::ptr;
-use std::sync::OnceLock;
+use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
+use std::time::Instant;
 use std::time::Duration;
 
 // --- Subset of Processing.NDI.Lib.h (NDI 5/6). Enums are 32-bit in the SDK. ---
@@ -80,43 +82,125 @@ struct Api {
 unsafe impl Send for Api {}
 unsafe impl Sync for Api {}
 
-fn candidate_paths() -> Vec<String> {
-    let mut v = Vec::new();
-    #[cfg(target_os = "macos")]
-    let file = "libndi.dylib";
-    #[cfg(target_os = "windows")]
-    let file = "Processing.NDI.Lib.x64.dll";
-    #[cfg(all(unix, not(target_os = "macos")))]
-    let file = "libndi.so.6";
-    for var in ["NDI_RUNTIME_DIR_V6", "NDI_RUNTIME_DIR_V5"] {
+/// Folders that may contain the NDI runtime library.
+fn candidate_dirs() -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    for var in ["NDI_RUNTIME_DIR_V6", "NDI_RUNTIME_DIR_V5", "NDI_RUNTIME_DIR_V4"] {
         if let Ok(dir) = std::env::var(var) {
-            v.push(format!("{dir}/{file}"));
+            dirs.push(dir.into());
         }
     }
     #[cfg(target_os = "macos")]
-    v.extend([
-        "/usr/local/lib/libndi.dylib".to_string(),
-        "/Library/NDI SDK for Apple/lib/macOS/libndi.dylib".to_string(),
-        "/Library/NDI Advanced SDK for Apple/lib/macOS/libndi_advanced.dylib".to_string(),
-        "/opt/homebrew/lib/libndi.dylib".to_string(),
-    ]);
+    {
+        for d in [
+            "/Library/NDI SDK for Apple/lib/macOS",
+            "/Library/NDI Advanced SDK for Apple/lib/macOS",
+            "/Library/NDI SDK for macOS/lib/macOS",
+            "/usr/local/lib",
+            "/opt/homebrew/lib",
+            "/Library/Frameworks",
+        ] {
+            dirs.push(d.into());
+        }
+        // NDI Tools apps bundle the runtime inside themselves.
+        for apps in ["/Applications", "/Applications/NDI Tools"] {
+            if let Ok(entries) = std::fs::read_dir(apps) {
+                for e in entries.flatten() {
+                    let name = e.file_name().to_string_lossy().to_string();
+                    if name.contains("NDI") && name.ends_with(".app") {
+                        for sub in ["Contents/Frameworks", "Contents/MacOS", "Contents/Resources"] {
+                            dirs.push(e.path().join(sub));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    #[cfg(target_os = "windows")]
+    dirs.push("C:\\Program Files\\NDI\\NDI 6 Runtime\\v6".into());
     #[cfg(all(unix, not(target_os = "macos")))]
-    v.extend(["libndi.so.6".to_string(), "libndi.so.5".to_string()]);
-    v.push(file.to_string());
-    v
+    dirs.extend(["/usr/lib".into(), "/usr/local/lib".into(), "/usr/lib/x86_64-linux-gnu".into()]);
+    dirs
+}
+
+fn is_ndi_lib(name: &str) -> bool {
+    #[cfg(target_os = "macos")]
+    return name.starts_with("libndi") && name.ends_with(".dylib");
+    #[cfg(target_os = "windows")]
+    return name.starts_with("Processing.NDI.Lib") && name.ends_with(".dll");
+    #[cfg(all(unix, not(target_os = "macos")))]
+    return name.starts_with("libndi.so");
+}
+
+/// Every NDI library file found, plain SDK builds before "advanced" ones.
+fn candidate_files() -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    for dir in candidate_dirs() {
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        let mut found: Vec<PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.file_name().is_some_and(|n| is_ndi_lib(&n.to_string_lossy())))
+            .collect();
+        found.sort_by_key(|p| p.to_string_lossy().contains("advanced"));
+        files.extend(found);
+    }
+    files
 }
 
 fn api() -> Result<&'static Api, String> {
-    static API: OnceLock<Result<Api, String>> = OnceLock::new();
-    API.get_or_init(|| unsafe { load() }).as_ref().map_err(|e| e.clone())
+    // Only success is cached, so installing NDI while the app runs is picked up (retried every
+    // few seconds rather than on every call).
+    static API: OnceLock<&'static Api> = OnceLock::new();
+    static LAST_TRY: Mutex<Option<(Instant, String)>> = Mutex::new(None);
+    if let Some(api) = API.get() {
+        return Ok(api);
+    }
+    let mut last = LAST_TRY.lock().unwrap();
+    if let Some((at, err)) = last.as_ref() {
+        if at.elapsed() < Duration::from_secs(5) {
+            return Err(err.clone());
+        }
+    }
+    match unsafe { load() } {
+        Ok(api) => {
+            let api: &'static Api = Box::leak(Box::new(api));
+            let _ = API.set(api);
+            log::info!("NDI runtime loaded");
+            Ok(api)
+        }
+        Err(e) => {
+            *last = Some((Instant::now(), e.clone()));
+            Err(e)
+        }
+    }
 }
 
 unsafe fn load() -> Result<Api, String> {
-    let paths = candidate_paths();
-    let lib = paths
-        .iter()
-        .find_map(|p| Library::new(p).ok())
-        .ok_or_else(|| "NDI runtime not found (install the NDI SDK / NDI Tools)".to_string())?;
+    let files = candidate_files();
+    let mut errors = Vec::new();
+    let mut lib = None;
+    for f in &files {
+        match Library::new(f) {
+            Ok(l) => {
+                log::info!("loading NDI runtime from {}", f.display());
+                lib = Some(l);
+                break;
+            }
+            Err(e) => errors.push(format!("{}: {e}", f.display())),
+        }
+    }
+    let Some(lib) = lib else {
+        let msg = if errors.is_empty() {
+            "NDI runtime not found. Run `find / -name \"libndi*\" 2>/dev/null` in Terminal to locate it, \
+             then start the app with NDI_RUNTIME_DIR_V6=<that folder>"
+                .to_string()
+        } else {
+            format!("NDI runtime found but failed to load: {}", errors.join("; "))
+        };
+        log::warn!("{msg}");
+        return Err(msg);
+    };
     macro_rules! sym {
         ($name:literal) => {
             *lib.get(concat!($name, "\0").as_bytes()).map_err(|e| format!("{}: {e}", $name))?
