@@ -27,8 +27,6 @@ pub struct App {
     show_threshold: bool,
     edit_keystone: bool,
     dragging: Option<usize>,
-    cameras: Vec<crate::camera::CameraSelection>,
-    camera_note: String,
     camera_tex: Option<egui::TextureHandle>,
     camera_tex_at: Instant,
 }
@@ -53,8 +51,6 @@ impl App {
             show_threshold: true,
             edit_keystone: false,
             dragging: None,
-            cameras: Vec::new(),
-            camera_note: String::new(),
             camera_tex: None,
             camera_tex_at: Instant::now(),
         }
@@ -305,6 +301,17 @@ impl App {
                         ui.selectable_value(&mut s.dac, d, d.label());
                     }
                 });
+            if s.dac == DacSelection::LaserCubeUsb {
+                let devices = self.shared.devices.lock().clone();
+                let connected = self.shared.output_status.lock().connected;
+                let (c, t) = match (devices.scanned.is_some(), devices.lasercubes, connected) {
+                    (_, _, true) => (Color32::GREEN, "LaserCube connected".to_string()),
+                    (false, _, _) => (Color32::GRAY, "Scanning USB...".to_string()),
+                    (true, 0, _) => (Color32::LIGHT_RED, "No LaserCube on USB - plug it in; it connects automatically".to_string()),
+                    (true, n, _) => (Color32::YELLOW, format!("{n} LaserCube(s) on USB, connecting... (close LaserOS if it's open)")),
+                };
+                ui.colored_label(c, t);
+            }
             let max_pps = self.shared.output_status.lock().max_pps.max(1000);
             let pps_max = max_pps.max(s.scan.pps);
             ui.add(egui::Slider::new(&mut s.scan.pps, 1000..=pps_max).text("DAC point rate (pps)"))
@@ -387,6 +394,7 @@ impl App {
     fn camera_controls(&mut self, ui: &mut egui::Ui, s: &mut Settings) {
         use crate::camera::{CameraSelection, CAM_H, CAM_W};
         ui.small("A camera pointed at the projection surface (never into the beam) lets a calibration session measure the real laser output.");
+        let devices = self.shared.devices.lock().clone();
         ui.horizontal(|ui| {
             egui::ComboBox::from_label("Camera")
                 .selected_text(s.camera.label())
@@ -394,16 +402,18 @@ impl App {
                 .show_ui(ui, |ui| {
                     ui.selectable_value(&mut s.camera, CameraSelection::None, "None");
                     ui.selectable_value(&mut s.camera, CameraSelection::Simulated, CameraSelection::Simulated.label());
-                    for c in &self.cameras {
+                    for c in &devices.cameras {
                         ui.selectable_value(&mut s.camera, c.clone(), c.label());
                     }
                 });
-            if ui.button("⟳").on_hover_text("Find cameras (needs ffmpeg: brew install ffmpeg)").clicked() {
-                (self.cameras, self.camera_note) = crate::camera::list_devices();
+            if ui.button("⟳").on_hover_text("Rescan now (cameras are rescanned every 2 s anyway; needs ffmpeg: brew install ffmpeg)").clicked() {
+                self.shared.rescan_devices.store(true, Ordering::SeqCst);
             }
         });
-        if !self.camera_note.is_empty() {
-            ui.small(&self.camera_note);
+        if devices.scanned.is_none() {
+            ui.small("Scanning for cameras...");
+        } else if !devices.camera_note.is_empty() {
+            ui.small(&devices.camera_note);
         }
         let (latest, msg, fps, frames, ff) = {
             let st = self.shared.camera.lock();
@@ -413,13 +423,18 @@ impl App {
             ui.small(msg);
         }
         if s.camera != CameraSelection::None {
-            let live = latest.as_ref().is_some_and(|f| f.at.elapsed() < Duration::from_millis(500));
-            ui.small(format!(
-                "{} - {:.0} fps, {} frames",
-                if live { "live" } else { "NOT receiving frames" },
-                fps,
-                frames
-            ));
+            let age = latest.as_ref().map(|f| f.at.elapsed().as_secs_f32());
+            let text = match age {
+                Some(a) if a < 0.5 => format!("live - {fps:.0} fps, {frames} frames"),
+                Some(a) => format!("NOT receiving frames - last one {a:.1} s ago ({frames} frames)"),
+                None => format!("NOT receiving frames ({frames} frames)"),
+            };
+            let colour = if age.is_some_and(|a| a < 0.5) { Color32::GREEN } else { Color32::LIGHT_RED };
+            ui.colored_label(colour, text);
+        }
+        if latest.is_none() {
+            // Never show a picture from a previous camera.
+            self.camera_tex = None;
         }
         if !ff.is_empty() {
             ui.colored_label(Color32::YELLOW, format!("ffmpeg:\n{ff}"));

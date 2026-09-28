@@ -4,6 +4,7 @@ mod calib_analysis;
 mod calibration;
 mod camera;
 mod dac;
+mod devices;
 mod engine;
 mod input;
 mod recorder;

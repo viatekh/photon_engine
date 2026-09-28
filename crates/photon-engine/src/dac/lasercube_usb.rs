@@ -52,6 +52,20 @@ pub struct LaserCubeUsb {
     bytes: Vec<u8>,
 }
 
+/// How many LaserCubes are on USB (whether or not another app has them open).
+pub fn count() -> usize {
+    use rusb::UsbContext;
+    // A private context: the global one panics if USB can't be initialised.
+    rusb::Context::new()
+        .and_then(|ctx| ctx.devices())
+        .map(|list| {
+            list.iter()
+                .filter(|d| d.device_descriptor().is_ok_and(|dd| dd.vendor_id() == VID && dd.product_id() == PID))
+                .count()
+        })
+        .unwrap_or(0)
+}
+
 impl LaserCubeUsb {
     pub fn open() -> anyhow::Result<Self> {
         let handle = rusb::open_device_with_vid_pid(VID, PID).context(

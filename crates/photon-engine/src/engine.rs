@@ -68,6 +68,9 @@ pub struct Shared {
     pub record_requested: AtomicBool,
     pub recording: Mutex<RecordingStatus>,
     pub camera: Mutex<crate::camera::CameraState>,
+    /// Latest hardware scan; `rescan_devices` asks for one now.
+    pub devices: Mutex<crate::devices::DeviceList>,
+    pub rescan_devices: AtomicBool,
     pub session: Mutex<crate::calibration::SessionStatus>,
     pub session_abort: AtomicBool,
     /// Never persisted: the app always starts disarmed.
@@ -88,6 +91,8 @@ impl Shared {
             record_requested: AtomicBool::new(false),
             recording: Mutex::new(RecordingStatus::default()),
             camera: Mutex::new(Default::default()),
+            devices: Mutex::new(Default::default()),
+            rescan_devices: AtomicBool::new(false),
             session: Mutex::new(Default::default()),
             session_abort: AtomicBool::new(false),
             armed: AtomicBool::new(false),
@@ -106,6 +111,7 @@ pub fn start(shared: Arc<Shared>) -> Vec<thread::JoinHandle<()>> {
     let s2 = shared;
     let s3 = s2.clone();
     vec![
+        crate::devices::start(s3.clone()),
         crate::camera::start(s3),
         thread::Builder::new().name("pipeline".into()).spawn(move || pipeline(s1)).unwrap(),
         thread::Builder::new().name("output".into()).spawn(move || output(s2)).unwrap(),

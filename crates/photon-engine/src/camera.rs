@@ -58,6 +58,8 @@ pub struct CameraState {
     pub fps: f32,
     /// Last lines ffmpeg printed (errors / warnings).
     pub ffmpeg_log: String,
+    /// Bumped whenever a capture starts or stops; readers of older captures drop their data.
+    pub generation: u64,
 }
 
 /// Video devices ffmpeg can see (macOS AVFoundation). Empty with a note if ffmpeg is missing.
@@ -127,12 +129,26 @@ const CONFIGS: &[(&str, &str, Option<&str>)] = &[
     ("nv12", "15", Some("640x480")),
 ];
 
+/// A capture setting that delivered fewer frames than this before stalling or exiting is
+/// treated as not working with this camera, and the next one is tried.
+const GOOD_FRAMES: u64 = 30;
+/// No first frame within this long, or no new frame for STALL once streaming: restart.
+const FIRST_FRAME: Duration = Duration::from_secs(6);
+const STALL: Duration = Duration::from_secs(2);
+
+/// One running ffmpeg process.
+struct Capture {
+    child: Child,
+    index: usize,
+    started: Instant,
+    frames_at_start: u64,
+}
+
 fn run(shared: Arc<Shared>) {
     let mut current = CameraSelection::None;
-    let mut child: Option<Child> = None;
-    let mut reader: Option<thread::JoinHandle<()>> = None;
+    let mut capture: Option<Capture> = None;
     let mut attempt = 0usize;
-    let mut frames_at_spawn = 0u64;
+    let mut retry_at = Instant::now();
     let sim_warp = Homography::from_points(
         [Vec2::new(-1.0, 1.0), Vec2::new(1.0, 1.0), Vec2::new(1.0, -1.0), Vec2::new(-1.0, -1.0)],
         // A slightly off-axis camera view, in camera pixels.
@@ -142,62 +158,19 @@ fn run(shared: Arc<Shared>) {
 
     while !shared.shutdown.load(Ordering::Relaxed) {
         let wanted = shared.settings.read().camera.clone();
-        let mut respawn = false;
         if wanted != current {
-            stop(&mut child, &mut reader);
+            stop(&shared, &mut capture);
             {
                 let mut st = shared.camera.lock();
                 st.latest = None;
                 st.fps = 0.0;
+                st.ffmpeg_log.clear();
             }
-            current = wanted.clone();
+            current = wanted;
             attempt = 0;
-            respawn = matches!(current, CameraSelection::Device { .. });
+            retry_at = Instant::now();
             if current == CameraSelection::None {
                 set_msg(&shared.camera, "");
-                shared.camera.lock().ffmpeg_log.clear();
-            }
-        }
-        if let (CameraSelection::Device { .. }, Some(c)) = (&current, child.as_mut()) {
-            if let Ok(Some(status)) = c.try_wait() {
-                stop(&mut child, &mut reader);
-                let got_frames = shared.camera.lock().frames > frames_at_spawn;
-                if !got_frames && attempt + 1 < CONFIGS.len() {
-                    attempt += 1;
-                    respawn = true;
-                } else {
-                    set_msg(
-                        &shared.camera,
-                        format!("ffmpeg stopped ({status}); check the camera and its permission (see messages below)"),
-                    );
-                }
-            }
-        }
-        if respawn {
-            if let CameraSelection::Device { index, .. } = &current {
-                let (pix, fps, size) = CONFIGS[attempt];
-                shared.camera.lock().ffmpeg_log.clear();
-                frames_at_spawn = shared.camera.lock().frames;
-                match spawn_ffmpeg(*index, pix, fps, size) {
-                    Ok((mut c, r)) => {
-                        if let Some(err) = c.stderr.take() {
-                            let sh = shared.clone();
-                            thread::spawn(move || read_log(sh, err));
-                        }
-                        child = Some(c);
-                        let sh = shared.clone();
-                        reader = Some(thread::spawn(move || read_frames(sh, r)));
-                        set_msg(
-                            &shared.camera,
-                            format!(
-                                "Capturing {} ({pix}, {fps} fps, {})",
-                                current.label(),
-                                size.unwrap_or("default size")
-                            ),
-                        );
-                    }
-                    Err(e) => set_msg(&shared.camera, format!("{e:#}")),
-                }
             }
         }
         match &current {
@@ -210,20 +183,121 @@ fn run(shared: Arc<Shared>) {
                 st.message = "Simulated camera".into();
                 drop(st);
                 thread::sleep(Duration::from_millis(33));
+                continue;
             }
-            _ => thread::sleep(Duration::from_millis(100)),
+            CameraSelection::None => {
+                thread::sleep(Duration::from_millis(100));
+                continue;
+            }
+            CameraSelection::Device { index, name } => {
+                // Device numbers can change when cameras are plugged / unplugged: find it by name.
+                let devices = shared.devices.lock().clone();
+                let found = devices.cameras.iter().find_map(|c| match c {
+                    CameraSelection::Device { index: i, name: n } if n == name => Some(*i),
+                    _ => None,
+                });
+                let present = match (devices.scanned, found) {
+                    (None, _) => Some(*index), // no scan yet: trust the saved number
+                    (Some(_), f) => f,
+                };
+                let Some(index) = present else {
+                    stop(&shared, &mut capture);
+                    shared.camera.lock().latest = None;
+                    set_msg(&shared.camera, format!("{name} not connected - waiting for it"));
+                    thread::sleep(Duration::from_millis(200));
+                    continue;
+                };
+                if capture.as_ref().is_some_and(|c| c.index != index) {
+                    log::info!("camera: {name} is now device {index}; restarting capture");
+                    stop(&shared, &mut capture);
+                    retry_at = Instant::now();
+                }
+                if let Some(c) = capture.as_mut() {
+                    let (frames, last) = {
+                        let st = shared.camera.lock();
+                        (st.frames - c.frames_at_start, st.latest.as_ref().map(|f| f.at))
+                    };
+                    let exited = c.child.try_wait().ok().flatten();
+                    let stalled = if frames == 0 {
+                        c.started.elapsed() > FIRST_FRAME
+                    } else {
+                        last.is_some_and(|t| t.elapsed() > STALL)
+                    };
+                    if exited.is_some() || stalled {
+                        let what = match exited {
+                            Some(status) => format!("ffmpeg stopped ({status})"),
+                            None if frames == 0 => "no picture from camera".to_string(),
+                            None => "camera feed froze".to_string(),
+                        };
+                        log::warn!("camera: {what} after {frames} frames with {:?}", CONFIGS[attempt]);
+                        stop(&shared, &mut capture);
+                        if frames < GOOD_FRAMES {
+                            attempt += 1;
+                            if attempt == CONFIGS.len() {
+                                attempt = 0;
+                                set_msg(
+                                    &shared.camera,
+                                    format!("{what}; tried every capture mode - check the camera and its permission, retrying"),
+                                );
+                                retry_at = Instant::now() + Duration::from_secs(3);
+                            }
+                        } else {
+                            // It was working with this setting (e.g. unplugged): retry the same.
+                            set_msg(&shared.camera, format!("{what}; restarting"));
+                            retry_at = Instant::now() + Duration::from_secs(1);
+                        }
+                    }
+                }
+                if capture.is_none() && Instant::now() >= retry_at {
+                    let (pix, fps, size) = CONFIGS[attempt];
+                    shared.camera.lock().ffmpeg_log.clear();
+                    match spawn_ffmpeg(index, pix, fps, size) {
+                        Ok((mut child, out)) => {
+                            let gen = {
+                                let mut st = shared.camera.lock();
+                                st.generation += 1;
+                                st.generation
+                            };
+                            if let Some(err) = child.stderr.take() {
+                                let sh = shared.clone();
+                                thread::spawn(move || read_log(sh, err, gen));
+                            }
+                            let sh = shared.clone();
+                            thread::spawn(move || read_frames(sh, out, gen));
+                            let frames_at_start = shared.camera.lock().frames;
+                            capture = Some(Capture { child, index, started: Instant::now(), frames_at_start });
+                            set_msg(
+                                &shared.camera,
+                                format!(
+                                    "Capturing {name} (device {index}; {pix}, {fps} fps, {})",
+                                    size.unwrap_or("default size")
+                                ),
+                            );
+                        }
+                        Err(e) => {
+                            set_msg(&shared.camera, format!("{e:#}"));
+                            retry_at = Instant::now() + Duration::from_secs(3);
+                        }
+                    }
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
         }
     }
-    stop(&mut child, &mut reader);
+    stop(&shared, &mut capture);
 }
 
-fn stop(child: &mut Option<Child>, reader: &mut Option<thread::JoinHandle<()>>) {
-    if let Some(mut c) = child.take() {
-        let _ = c.kill();
-        let _ = c.wait();
-    }
-    if let Some(r) = reader.take() {
-        let _ = r.join();
+/// Kill ffmpeg. Its reader threads end by themselves (and are ignored from now on, via the
+/// generation number), so this never waits on them.
+fn stop(shared: &Shared, capture: &mut Option<Capture>) {
+    if let Some(mut c) = capture.take() {
+        {
+            let mut st = shared.camera.lock();
+            st.generation += 1;
+            st.fps = 0.0;
+        }
+        let _ = c.child.kill();
+        let _ = c.child.wait();
     }
 }
 
@@ -234,7 +308,7 @@ fn spawn_ffmpeg(
     size: Option<&str>,
 ) -> anyhow::Result<(Child, std::process::ChildStdout)> {
     // Input options must match a mode the device lists; output is scaled to CAM_W x CAM_H RGB.
-    let mut args: Vec<String> = ["-hide_banner", "-loglevel", "error", "-f", "avfoundation"]
+    let mut args: Vec<String> = ["-hide_banner", "-nostdin", "-loglevel", "error", "-f", "avfoundation"]
         .iter()
         .map(|s| s.to_string())
         .collect();
@@ -266,12 +340,15 @@ fn spawn_ffmpeg(
 }
 
 /// Forward ffmpeg's messages to the log and the camera panel.
-fn read_log(shared: Arc<Shared>, err: std::process::ChildStderr) {
+fn read_log(shared: Arc<Shared>, err: std::process::ChildStderr, gen: u64) {
     use std::io::BufRead;
     for line in std::io::BufReader::new(err).lines().map_while(Result::ok) {
         log::warn!("ffmpeg: {line}");
         // Keep the last few lines: ffmpeg's errors span several (e.g. the supported-mode list).
         let mut st = shared.camera.lock();
+        if st.generation != gen {
+            continue;
+        }
         let mut lines: Vec<&str> = st.ffmpeg_log.lines().collect();
         lines.push(line.trim());
         let keep = lines.len().saturating_sub(12);
@@ -279,19 +356,21 @@ fn read_log(shared: Arc<Shared>, err: std::process::ChildStderr) {
     }
 }
 
-fn read_frames(shared: Arc<Shared>, mut out: std::process::ChildStdout) {
+fn read_frames(shared: Arc<Shared>, mut out: std::process::ChildStdout, gen: u64) {
     let size = CAM_W * CAM_H * 3;
     let mut since = Instant::now();
     let mut count = 0u32;
     loop {
         let mut buf = vec![0u8; size];
         if out.read_exact(&mut buf).is_err() {
-            log::warn!("camera: ffmpeg stream ended");
-            shared.camera.lock().fps = 0.0;
+            log::info!("camera: ffmpeg stream ended");
             return;
         }
         count += 1;
         let mut st = shared.camera.lock();
+        if st.generation != gen {
+            return; // a newer capture has taken over
+        }
         st.latest = Some(Arc::new(CamFrame { rgb: buf, at: Instant::now() }));
         st.frames += 1;
         if since.elapsed() >= Duration::from_secs(1) {
@@ -329,3 +408,4 @@ fn simulated_frame(shared: &Shared, warp: &Homography) -> CamFrame {
     let rgb = acc.iter().map(|&v| (((v * 0.35).min(1.0) * 255.0) as u8).saturating_add(6)).collect();
     CamFrame { rgb, at: Instant::now() }
 }
+

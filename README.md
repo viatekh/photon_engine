@@ -104,8 +104,10 @@ For development: a webcam watching the projection lets me measure what the real 
 1. `brew install ffmpeg` (used to read the webcam).
 2. Point a USB webcam at the projection surface - **never into the beam**. Fixed on a stand,
    whole projection in view, dim room.
-3. Left panel → **Camera & calibration** → ⟳ to list cameras → pick yours. The preview should
-   show the laser. (macOS will ask for camera permission for the Terminal the first time.)
+3. Left panel → **Camera & calibration** → pick yours. The preview should show the laser, live,
+   with a green "live - 30 fps" line. (macOS will ask for camera permission for the Terminal the
+   first time.) If the feed freezes or ffmpeg refuses a capture mode, the app tries the next
+   mode by itself; the panel shows the mode in use and ffmpeg's messages.
 4. Arm the laser, click **Run calibration session**. It draws ~28 test patterns (≈1 minute),
    restores your settings, and saves `recordings/calib-<time>.jsonl.gz`.
 5. Send that file (git push, as with recordings).
@@ -113,6 +115,13 @@ For development: a webcam watching the projection lets me measure what the real 
 `--analyse-calibration FILE OUT_DIR` aligns the camera to laser coordinates, writes overlays
 (commanded path in red over the camera image) and measures coverage / stray light per step.
 "Simulated (galvo model)" camera runs the whole flow without hardware.
+
+## Plugging devices in and out
+
+Cameras and LaserCubes are rescanned every 2 s, so there's no need to restart the app. A camera is
+remembered by name (macOS renumbers cameras when they're re-plugged) and capture resumes when it
+comes back. The LaserCube reconnects by itself; Output shows whether one is on USB. Syphon / NDI
+sources are also refreshed every 2 s and reconnect after a dropout.
 
 ## Safety behaviour
 
