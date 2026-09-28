@@ -50,6 +50,8 @@ pub struct LaserCubeUsb {
     /// None if the device answers the "empty samples" query; otherwise we pace by time.
     timed: Option<(f64, Instant)>,
     bytes: Vec<u8>,
+    /// Transfers the cube only partly accepted (the rest was re-sent).
+    partial_writes: u64,
 }
 
 /// How many LaserCubes are on USB (whether or not another app has them open).
@@ -86,6 +88,7 @@ impl LaserCubeUsb {
             packet_samples: 64,
             timed: None,
             bytes: Vec::new(),
+            partial_writes: 0,
         };
         dev.version = (
             dev.get_u32(CMD_GET_VERSION_MAJOR).unwrap_or(0),
@@ -191,9 +194,29 @@ impl Dac for LaserCubeUsb {
                     self.bytes.extend_from_slice(&v.to_le_bytes());
                 }
             }
-            let n = self.handle.write_bulk(EP_DATA_OUT, &self.bytes, TIMEOUT).context("LaserCube sample write")?;
-            if n != self.bytes.len() {
-                bail!("LaserCube accepted {n} of {} bytes", self.bytes.len());
+            // The cube sometimes takes only part of a transfer (seen on an LC-2000 on macOS:
+            // 128 of 512 bytes); send the rest instead of dropping the connection.
+            let mut sent = 0;
+            let deadline = Instant::now() + TIMEOUT;
+            while sent < self.bytes.len() {
+                let n = self
+                    .handle
+                    .write_bulk(EP_DATA_OUT, &self.bytes[sent..], TIMEOUT)
+                    .context("LaserCube sample write")?;
+                sent += n;
+                if sent < self.bytes.len() {
+                    self.partial_writes += 1;
+                    if self.partial_writes.is_power_of_two() {
+                        log::warn!(
+                            "LaserCube took {n} of {} bytes; re-sending the rest ({} partial transfers so far)",
+                            self.bytes.len() - (sent - n),
+                            self.partial_writes
+                        );
+                    }
+                    if Instant::now() > deadline {
+                        bail!("LaserCube accepted only {sent} of {} bytes", self.bytes.len());
+                    }
+                }
             }
         }
         if let Some((buffered, _)) = &mut self.timed {

@@ -319,6 +319,12 @@ fn spawn_ffmpeg(
     args.extend([
         "-i".into(),
         format!("{index}:none"),
+        // Pass each camera frame through once. AVFoundation reports a nominal 1,000,000 fps
+        // (microsecond timestamps), and the rawvideo output otherwise defaults to constant
+        // frame rate: ffmpeg then floods the pipe with copies of the first frame, so the
+        // picture looks frozen while "frames" keep arriving.
+        "-fps_mode".into(),
+        "passthrough".into(),
         "-vf".into(),
         format!("scale={CAM_W}:{CAM_H}"),
         "-pix_fmt".into(),
