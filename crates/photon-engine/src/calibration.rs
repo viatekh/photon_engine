@@ -58,8 +58,10 @@ fn steps() -> Vec<Step> {
         s.scan.lit_accel = 3e5;
     }));
     // Mirror dynamics: speed x acceleration on sharp corners and tight curves.
-    for speed in [400.0f32, 600.0, 900.0] {
-        for accel in [0.6e6f32, 1.2e6, 2.5e6, 5e6] {
+    // (First LC-2000 session: everything up to 900 / 2.5e6 was clean, 5e6 rounded corners;
+    // this range looks for the limit above the current defaults.)
+    for speed in [600.0f32, 900.0, 1200.0, 1500.0] {
+        for accel in [1.2e6f32, 2.5e6, 3.5e6, 5e6] {
             v.push(step(format!("scanner speed={speed} accel={accel:.1e}"), move |s| {
                 s.test_pattern = TestPattern::ScannerTest;
                 s.scan.lit_speed = speed;

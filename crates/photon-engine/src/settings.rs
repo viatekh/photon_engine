@@ -38,7 +38,7 @@ pub struct Settings {
     pub static_beam_min_extent: f32,
 }
 
-pub const SETTINGS_VERSION: u32 = 5;
+pub const SETTINGS_VERSION: u32 = 6;
 
 impl Settings {
     /// Bring settings saved by an older version up to date. Tracing / planning settings reset to
@@ -46,6 +46,16 @@ impl Settings {
     pub fn migrate(self) -> Self {
         if self.version >= SETTINGS_VERSION {
             return self;
+        }
+        if self.version == 5 {
+            // v6: only the lit speed / acceleration defaults changed (camera measurements).
+            log::info!("settings from version 5 - updating lit speed / acceleration to measured defaults");
+            let d = ScanParams::default();
+            return Settings {
+                version: SETTINGS_VERSION,
+                scan: ScanParams { lit_speed: d.lit_speed, lit_accel: d.lit_accel, ..self.scan },
+                ..self
+            };
         }
         log::info!("settings from version {} - resetting tracing defaults", self.version);
         Settings {

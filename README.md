@@ -103,7 +103,8 @@ For development: a webcam watching the projection lets me measure what the real 
 
 1. `brew install ffmpeg` (used to read the webcam).
 2. Point a USB webcam at the projection surface - **never into the beam**. Fixed on a stand,
-   whole projection in view, dim room.
+   whole projection in view, nothing in front of it, room as dark as possible (the analysis copes
+   with some ambient light, but the webcam's auto exposure then drops to ~6 fps).
 3. Left panel → **Camera & calibration** → pick yours. The preview should show the laser, live,
    with a green "live - 30 fps" line. (macOS will ask for camera permission for the Terminal the
    first time.) If the feed freezes or ffmpeg refuses a capture mode, the app tries the next

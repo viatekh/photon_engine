@@ -50,8 +50,11 @@ impl Default for ScanParams {
         Self {
             pps: 30_000,
             scanner_kpps: 30.0,
-            lit_speed: 600.0,
-            lit_accel: 1.2e6,
+            // Measured on an LC-2000 with a camera (calibration 2026-09): 900 / 2.5e6 draws
+            // corners and curves as cleanly as 600 / 1.2e6 did, with ~23% fewer points per shape.
+            // 5e6 starts rounding star points.
+            lit_speed: 900.0,
+            lit_accel: 2.5e6,
             corner_tolerance: 0.003,
             blank_speed: 1800.0,
             blank_accel: 3.0e6,

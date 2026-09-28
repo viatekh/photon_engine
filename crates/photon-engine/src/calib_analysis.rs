@@ -26,7 +26,6 @@ struct Img {
     h: usize,
     /// Brightness 0..1 (max channel), background subtracted.
     v: Vec<f32>,
-    red: Vec<f32>,
 }
 
 fn decode(v: &Value, key: &str, w: usize, h: usize) -> anyhow::Result<Vec<u8>> {
@@ -37,19 +36,69 @@ fn decode(v: &Value, key: &str, w: usize, h: usize) -> anyhow::Result<Vec<u8>> {
     Ok(raw)
 }
 
+/// Laser light only: each channel minus its local background (a morphological opening with a
+/// radius wider than a laser line, which removes the lines and keeps the lit wall). This copes
+/// with ambient light and with the webcam changing exposure / white balance between steps,
+/// which a plain "minus the dark frame" does not.
 fn to_img(rgb: &[u8], dark: Option<&[u8]>, w: usize, h: usize) -> Img {
-    let mut v = vec![0.0; w * h];
-    let mut red = vec![0.0; w * h];
-    for i in 0..w * h {
-        let c = |k: usize| {
-            let d = dark.map(|d| d[i * 3 + k] as f32).unwrap_or(0.0);
-            ((rgb[i * 3 + k] as f32 - d) / 255.0).max(0.0)
-        };
-        let (r, g, b) = (c(0), c(1), c(2));
-        v[i] = r.max(g).max(b);
-        red[i] = (r - g.max(b)).max(0.0);
+    const R: usize = 12;
+    let tophat = |img: &[u8], k: usize| -> Vec<f32> {
+        let c: Vec<f32> = (0..w * h).map(|i| img[i * 3 + k] as f32 / 255.0).collect();
+        let bg = opening(&c, w, h, R);
+        c.iter().zip(&bg).map(|(v, b)| (v - b).max(0.0)).collect()
+    };
+    let median = |img: &[u8], k: usize| -> f32 {
+        let mut v: Vec<u8> = (0..w * h).step_by(7).map(|i| img[i * 3 + k]).collect();
+        v.sort_unstable();
+        v[v.len() / 2] as f32
+    };
+    let mut chans = [vec![0.0f32; w * h], vec![0.0f32; w * h], vec![0.0f32; w * h]];
+    for k in 0..3 {
+        let mut t = tophat(rgb, k);
+        // Fine static detail (railings, edges) is in the laser-off frame too: remove it,
+        // scaled for the camera's exposure change and dilated a little for camera shake.
+        if let Some(d) = dark {
+            let gain = (median(rgb, k) + 1.0) / (median(d, k) + 1.0);
+            let td = dilate(&tophat(d, k), w, h, 2);
+            for (v, s) in t.iter_mut().zip(&td) {
+                *v = (*v - s * gain * 1.2).max(0.0);
+            }
+        }
+        chans[k] = t;
     }
-    Img { w, h, v, red }
+    let v = (0..w * h).map(|i| chans[0][i].max(chans[1][i]).max(chans[2][i])).collect();
+    Img { w, h, v }
+}
+
+fn dilate(c: &[f32], w: usize, h: usize, r: usize) -> Vec<f32> {
+    morph(&morph(c, w, h, r, true, false), w, h, r, false, false)
+}
+
+fn morph(src: &[f32], w: usize, h: usize, r: usize, horizontal: bool, take_min: bool) -> Vec<f32> {
+    let mut out = vec![0.0f32; w * h];
+    let (n, m) = if horizontal { (h, w) } else { (w, h) };
+    let idx = |line: usize, j: usize| if horizontal { line * w + j } else { j * w + line };
+    let mut buf = vec![0.0f32; m];
+    for line in 0..n {
+        for j in 0..m {
+            buf[j] = src[idx(line, j)];
+        }
+        for j in 0..m {
+            let (lo, hi) = (j.saturating_sub(r), (j + r).min(m - 1));
+            let mut v = buf[lo];
+            for &x in &buf[lo + 1..=hi] {
+                v = if take_min { v.min(x) } else { v.max(x) };
+            }
+            out[idx(line, j)] = v;
+        }
+    }
+    out
+}
+
+/// Grey-scale opening (erode then dilate) with a square of radius r.
+fn opening(c: &[f32], w: usize, h: usize, r: usize) -> Vec<f32> {
+    let e = morph(&morph(c, w, h, r, true, true), w, h, r, false, true);
+    morph(&morph(&e, w, h, r, true, false), w, h, r, false, false)
 }
 
 /// Threshold for "lit": a fraction of the bright end of the image.
@@ -73,7 +122,6 @@ pub fn run(input: &str, out_dir: &str) -> anyhow::Result<()> {
     let reader = BufReader::new(GzDecoder::new(std::fs::File::open(input)?));
     let (mut w, mut h) = (0usize, 0usize);
     let mut steps: Vec<Step> = Vec::new();
-    let mut max_images: Vec<Vec<u8>> = Vec::new();
     for line in reader.lines() {
         let line = line?;
         if line.trim().is_empty() {
@@ -97,25 +145,41 @@ pub fn run(input: &str, out_dir: &str) -> anyhow::Result<()> {
                             .collect()
                     })
                     .unwrap_or_default();
-                max_images.push(decode(&v, "max_rgb", w, h)?);
                 steps.push(Step { name: v["name"].as_str().unwrap_or("").to_string(), mean: decode(&v, "mean_rgb", w, h)?, sent });
             }
             _ => {}
         }
     }
-    let dark = steps.iter().position(|s| s.name == "dark").map(|i| steps[i].mean.clone());
     let reg_i = steps.iter().position(|s| s.name == "registration").context("no registration step")?;
-    let reg = to_img(&max_images[reg_i], dark.as_deref(), w, h);
-    let hmg = register(&reg).context("could not find the registration border in the camera image")?;
-    println!("registration: laser (-0.9,0.9) -> camera {:?}", hmg.apply(Vec2::new(-0.9, 0.9)));
+    let dark = steps.iter().position(|s| s.name == "dark").map(|i| steps[i].mean.clone());
+    let reg = to_img(&steps[reg_i].mean, dark.as_deref(), w, h);
+    let hmg = register(&reg, &steps[reg_i].sent).context("could not find the registration border in the camera image")?;
+    let corners = [Vec2::new(-1.0, 1.0), Vec2::new(1.0, 1.0), Vec2::new(1.0, -1.0), Vec2::new(-1.0, -1.0)];
+    println!(
+        "registration: laser corners (-0.9,0.9) (0.9,0.9) (0.9,-0.9) (-0.9,-0.9) -> camera {:?}",
+        corners.map(|c| { let p = hmg.apply(c * 0.9); (p.x.round(), p.y.round()) })
+    );
 
     println!("{:<34} {:>9} {:>8} {:>10}", "step", "coverage", "stray", "stray p95");
     let mut summary = String::new();
+    let mut delay_shift: Vec<(f32, f32)> = Vec::new();
     for (i, st) in steps.iter().enumerate() {
         if st.name == "dark" {
             continue;
         }
-        let img = to_img(&st.mean, dark.as_deref(), w, h);
+        let mut img = to_img(&st.mean, dark.as_deref(), w, h);
+        // Only look inside (slightly beyond) the projection area: reflections elsewhere
+        // (windows, shiny surfaces) aren't the scanner's fault.
+        if let Some(inv) = Homography::from_points(corners.map(|c| hmg.apply(c)), corners) {
+            for y in 0..h {
+                for x in 0..w {
+                    let q = inv.apply(Vec2::new(x as f32, y as f32));
+                    if q.x.abs() > 1.05 || q.y.abs() > 1.05 {
+                        img.v[y * w + x] = 0.0;
+                    }
+                }
+            }
+        }
         // Commanded lit segments in camera pixels.
         let segs: Vec<(Vec2, Vec2)> = st
             .sent
@@ -158,13 +222,28 @@ pub fn run(input: &str, out_dir: &str) -> anyhow::Result<()> {
         summary.push('\n');
         if st.name.starts_with("delay") {
             if let Some((lr, rl)) = comb_offsets(&img, &hmg, thr) {
-                let line = format!("    comb: lit start/end offset L->R {:+.3}/{:+.3}  R->L {:+.3}/{:+.3} (laser units, + = later along the stroke)", lr.0, lr.1, rl.0, rl.1);
+                // Blur widens both ends equally; a timing error moves both ends the same way.
+                // Averaging the two directions cancels any leftover registration offset.
+                let shift = ((lr.0 + lr.1) / 2.0 + (rl.0 + rl.1) / 2.0) / 2.0;
+                if let Some(d) = st.name.rsplit('=').next().and_then(|v| v.parse::<f32>().ok()) {
+                    delay_shift.push((d, shift));
+                }
+                let line = format!("    comb: lit start/end offset L->R {:+.3}/{:+.3}  R->L {:+.3}/{:+.3}  shift {:+.4} (laser units, + = light late)", lr.0, lr.1, rl.0, rl.1, shift);
                 println!("{line}");
                 summary += &line;
                 summary.push('\n');
             }
         }
         save_overlay(&format!("{out_dir}/step{i:02}.ppm"), &img, &segs, w, h)?;
+    }
+    // Colour delay estimate: where the light's shift along the stroke crosses zero.
+    if let Some(w) = delay_shift.windows(2).find(|w| w[0].1 <= 0.0 && w[1].1 > 0.0) {
+        let ((d0, s0), (d1, s1)) = (w[0], w[1]);
+        let best = d0 + (d1 - d0) * (-s0) / (s1 - s0);
+        let line = format!("colour delay estimate: {best:.0} us (light neither early nor late)");
+        println!("{line}");
+        summary += &line;
+        summary.push('\n');
     }
     std::fs::write(format!("{out_dir}/summary.txt"), summary)?;
     Ok(())
@@ -212,10 +291,12 @@ fn lit_near(img: &Img, q: Vec2, r: isize, thr: f32) -> bool {
 
 /// Homography laser -> camera from the registration image: the border's four corners
 /// (commanded at +-0.9) and the red mark at the top-left corner to fix orientation.
-fn register(img: &Img) -> Option<Homography> {
+fn register(img: &Img, sent: &[[f32; 5]]) -> Option<Homography> {
     let thr = lit_threshold(img);
-    let pts: Vec<Vec2> = (0..img.w * img.h)
-        .filter(|&i| img.v[i] >= thr)
+    // The border is one closed loop: take the largest connected lit region, so reflections
+    // and stray light elsewhere in the picture don't pull the corners.
+    let pts: Vec<Vec2> = largest_component(img, thr)
+        .into_iter()
         .map(|i| Vec2::new((i % img.w) as f32, (i / img.w) as f32))
         .collect();
     if pts.len() < 50 {
@@ -223,22 +304,50 @@ fn register(img: &Img) -> Option<Homography> {
     }
     // Extreme points along the diagonals: corners of a convex quadrilateral.
     let ext = |f: &dyn Fn(Vec2) -> f32| pts.iter().copied().max_by(|a, b| f(*a).total_cmp(&f(*b))).unwrap();
-    let quad = [ext(&|p| -p.x - p.y), ext(&|p| p.x - p.y), ext(&|p| p.x + p.y), ext(&|p| -p.x + p.y)];
-    // Red mark centroid.
-    let (mut rs, mut rn) = (Vec2::ZERO, 0.0f32);
-    let rmax = img.red.iter().copied().fold(0.0f32, f32::max);
-    for i in 0..img.w * img.h {
-        if img.red[i] > rmax * 0.5 && rmax > 0.05 {
-            rs = rs + Vec2::new((i % img.w) as f32, (i / img.w) as f32);
-            rn += 1.0;
+    let mut quad = [ext(&|p| -p.x - p.y), ext(&|p| p.x - p.y), ext(&|p| p.x + p.y), ext(&|p| -p.x + p.y)];
+    // Refine: fit a line to the middle part of each side and intersect neighbours, so a
+    // corner hidden behind something (or a stray blob near one) doesn't skew the result.
+    let dim: Vec<Vec2> = (0..img.w * img.h)
+        .filter(|&i| img.v[i] >= thr * 0.4)
+        .map(|i| Vec2::new((i % img.w) as f32, (i / img.w) as f32))
+        .collect();
+    for band in [40.0f32, 15.0, 8.0] {
+        let mut lines = Vec::new();
+        for k in 0..4 {
+            let (a, b) = (quad[k], quad[(k + 1) % 4]);
+            let d = b - a;
+            let len = d.length().max(1.0);
+            let dir = d * (1.0 / len);
+            let normal = Vec2::new(-dir.y, dir.x);
+            let near: Vec<Vec2> = dim
+                .iter()
+                .copied()
+                .filter(|&p| {
+                    let t = (p - a).dot(dir) / len;
+                    (0.15..0.85).contains(&t) && (p - a).dot(normal).abs() < band
+                })
+                .collect();
+            lines.push(fit_line(&near)?);
         }
+        let mut next = quad;
+        for k in 0..4 {
+            next[(k + 1) % 4] = intersect(lines[k], lines[(k + 1) % 4])?;
+        }
+        quad = next;
     }
-    let red = if rn > 0.0 { rs * (1.0 / rn) } else { quad[0] };
+    // The corner mark (drawn inside the top-left corner) breaks the square's symmetry: try
+    // every rotation and both windings, and keep the one under which the commanded lit points
+    // away from the border land on the most light.
+    let mark: Vec<Vec2> = sent
+        .iter()
+        .filter(|p| p[2] + p[3] + p[4] > 0.0 && p[0].abs() < 0.85 && p[1].abs() < 0.85)
+        .map(|p| Vec2::new(p[0], p[1]))
+        .collect();
     let laser = [Vec2::new(-0.9, 0.9), Vec2::new(0.9, 0.9), Vec2::new(0.9, -0.9), Vec2::new(-0.9, -0.9)];
-    // Try every rotation and both windings; keep the one that puts the red mark (laser
-    // (-0.7, 0.7) region) closest to where red was seen.
     let mut best: Option<(f32, Homography)> = None;
-    for mirror in [false, true] {
+    // A camera looking at the projection surface never sees it mirrored (and the mark can't
+    // tell a mirror across its diagonal apart), so only rotations are tried.
+    for mirror in [false] {
         for rot in 0..4 {
             let mut cam = [Vec2::ZERO; 4];
             for k in 0..4 {
@@ -246,14 +355,111 @@ fn register(img: &Img) -> Option<Homography> {
                 cam[k] = quad[j];
             }
             if let Some(h) = Homography::from_points(laser, cam) {
-                let d = h.apply(Vec2::new(-0.73, 0.73)).distance(red);
-                if best.as_ref().is_none_or(|b| d < b.0) {
-                    best = Some((d, h));
+                let score: f32 = mark.iter().map(|&p| if lit_near(img, h.apply(p), 2, thr) { 1.0 } else { 0.0 }).sum();
+                if best.as_ref().is_none_or(|b| score > b.0) {
+                    best = Some((score, h));
                 }
             }
         }
     }
     best.map(|b| b.1)
+}
+
+/// Robust line through points (RANSAC, then least squares on the inliers): (a point on it,
+/// unit direction). Robust because lit clutter (leaves, reflections) can sit next to a side.
+fn fit_line(pts: &[Vec2]) -> Option<(Vec2, Vec2)> {
+    if pts.len() < 10 {
+        return None;
+    }
+    let mut seed = 0x2545_f491_4f6c_dd1du64;
+    let mut rand = |n: usize| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        (seed % n as u64) as usize
+    };
+    let inliers = |p0: Vec2, dir: Vec2| -> Vec<Vec2> {
+        let normal = Vec2::new(-dir.y, dir.x);
+        pts.iter().copied().filter(|&p| (p - p0).dot(normal).abs() < 3.0).collect()
+    };
+    let mut best: Vec<Vec2> = Vec::new();
+    for _ in 0..300 {
+        let (a, b) = (pts[rand(pts.len())], pts[rand(pts.len())]);
+        let d = b - a;
+        if d.length() < 20.0 {
+            continue;
+        }
+        let inl = inliers(a, d * (1.0 / d.length()));
+        if inl.len() > best.len() {
+            best = inl;
+        }
+    }
+    if best.len() < 10 {
+        return None;
+    }
+    let (c, dir) = least_squares_line(&best);
+    Some(least_squares_line(&inliers(c, dir)))
+}
+
+fn least_squares_line(pts: &[Vec2]) -> (Vec2, Vec2) {
+    let n = pts.len().max(1) as f32;
+    let c = pts.iter().fold(Vec2::ZERO, |s, &p| s + p) * (1.0 / n);
+    let (mut sxx, mut sxy, mut syy) = (0.0f32, 0.0f32, 0.0f32);
+    for &p in pts {
+        let d = p - c;
+        sxx += d.x * d.x;
+        sxy += d.x * d.y;
+        syy += d.y * d.y;
+    }
+    let angle = 0.5 * (2.0 * sxy).atan2(sxx - syy);
+    (c, Vec2::new(angle.cos(), angle.sin()))
+}
+
+fn intersect(l1: (Vec2, Vec2), l2: (Vec2, Vec2)) -> Option<Vec2> {
+    let (p, r) = l1;
+    let (q, s) = l2;
+    let den = r.x * s.y - r.y * s.x;
+    if den.abs() < 1e-6 {
+        return None;
+    }
+    let t = ((q.x - p.x) * s.y - (q.y - p.y) * s.x) / den;
+    Some(p + r * t)
+}
+
+fn largest_component(img: &Img, thr: f32) -> Vec<usize> {
+    let (w, h) = (img.w, img.h);
+    let mut seen = vec![false; w * h];
+    let mut best = Vec::new();
+    for start in 0..w * h {
+        if seen[start] || img.v[start] < thr {
+            continue;
+        }
+        let mut comp = vec![start];
+        seen[start] = true;
+        let mut k = 0;
+        while k < comp.len() {
+            let i = comp[k];
+            k += 1;
+            let (x, y) = ((i % w) as isize, (i / w) as isize);
+            for dy in -2..=2isize {
+                for dx in -2..=2isize {
+                    let (nx, ny) = (x + dx, y + dy);
+                    if nx < 0 || ny < 0 || nx >= w as isize || ny >= h as isize {
+                        continue;
+                    }
+                    let j = ny as usize * w + nx as usize;
+                    if !seen[j] && img.v[j] >= thr {
+                        seen[j] = true;
+                        comp.push(j);
+                    }
+                }
+            }
+        }
+        if comp.len() > best.len() {
+            best = comp;
+        }
+    }
+    best
 }
 
 /// Chamfer distance (pixels) from every pixel to the nearest commanded segment.
